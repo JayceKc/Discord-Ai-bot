@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol
@@ -76,9 +75,9 @@ class LLMService:
         timeout: float = 300.0,
         client: OllamaClientProtocol | None = None,
     ) -> None:
-        # 參數優先，其次讀取環境變數，最後才使用預設值。
-        self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        # 環境變數統一由 config.py 讀取；服務只接受傳入值或使用預設值。
+        self.host = (host or DEFAULT_OLLAMA_HOST).rstrip("/")
+        self.model = model or DEFAULT_OLLAMA_MODEL
         # 測試時可以注入 Fake Client；正式執行則建立官方 AsyncClient。
         self.client = client or AsyncClient(host=self.host, timeout=timeout)
 

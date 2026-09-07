@@ -76,6 +76,17 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(LLMServiceError, "Ollama 回應逾時"):
             await service.chat("問題")
 
+    async def test_chat_converts_connection_error_to_service_error(self):
+        # 模擬本機 11434 port 無法連線，常見原因是 Ollama 尚未啟動。
+        request = httpx.Request("POST", "http://localhost:11434/api/chat")
+        fake_client = FakeOllamaClient(
+            error=httpx.ConnectError("connection refused", request=request)
+        )
+        service = LLMService(client=fake_client)
+
+        with self.assertRaisesRegex(LLMServiceError, "無法連線到 Ollama"):
+            await service.chat("問題")
+
     async def test_chat_rejects_missing_message_content(self):
         # 模擬 API 成功，但回覆內沒有 message.content。
         service = LLMService(client=FakeOllamaClient(response={"message": {}}))

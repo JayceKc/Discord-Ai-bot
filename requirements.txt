@@ -1,4 +1,4 @@
-discord.py
-python-dotenv
-ollama
-httpx
+discord.py==2.7.1
+python-dotenv==1.2.2
+ollama==0.3.3
+httpx==0.27.2
