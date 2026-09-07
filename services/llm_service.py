@@ -1,0 +1,157 @@
+"""使用 Ollama 官方 Python 套件產生模型回覆。"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from dataclasses import dataclass
+from typing import Any, Mapping, Protocol
+
+import httpx
+from ollama import AsyncClient, ResponseError
+
+
+# Ollama 本機服務的預設網址，以及這個專案固定使用的模型。
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
+
+# 使用 Python logging 記錄統計，不使用 print，方便未來統一管理日誌。
+logger = logging.getLogger(__name__)
+
+
+class LLMServiceError(RuntimeError):
+    """呼叫或解析 Ollama API 時發生的可預期錯誤。"""
+
+
+@dataclass(frozen=True)
+class LLMUsage:
+    """單次 Ollama 推論的時間與 Token 統計。"""
+
+    # Python 實際等待整個請求完成的秒數。
+    request_duration_seconds: float
+    # Ollama 回傳的時間單位是奈秒（nanosecond）。
+    total_duration_ns: int | None
+    load_duration_ns: int | None
+    # prompt_eval_count 是輸入 Token，eval_count 是模型輸出 Token。
+    prompt_tokens: int | None
+    completion_tokens: int | None
+
+    @property
+    def total_tokens(self) -> int | None:
+        # 只要其中一個統計缺失，就不猜測總 Token。
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
+        return self.prompt_tokens + self.completion_tokens
+
+
+@dataclass(frozen=True)
+class LLMResponse:
+    """已解析的模型文字與推論統計。"""
+
+    content: str
+    usage: LLMUsage
+
+
+class OllamaClientProtocol(Protocol):
+    """正式 Client 與測試 Fake Client 共用的最小介面。"""
+
+    async def chat(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        stream: bool,
+    ) -> Any:
+        """產生一次非串流聊天回應。"""
+
+
+class LLMService:
+    """使用 `ollama.AsyncClient` 呼叫 `/api/chat`。"""
+
+    def __init__(
+        self,
+        host: str | None = None,
+        model: str | None = None,
+        timeout: float = 300.0,
+        client: OllamaClientProtocol | None = None,
+    ) -> None:
+        # 參數優先，其次讀取環境變數，最後才使用預設值。
+        self.host = (host or os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)).rstrip("/")
+        self.model = model or os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        # 測試時可以注入 Fake Client；正式執行則建立官方 AsyncClient。
+        self.client = client or AsyncClient(host=self.host, timeout=timeout)
+
+    async def chat(self, message: str) -> LLMResponse:
+        """傳送單輪聊天訊息並回傳文字與使用量統計。"""
+
+        started_at = time.perf_counter()  # 高精度計時器，適合測量經過時間。
+
+        try:
+            # AsyncClient.chat 會由 Ollama 套件替我們呼叫 POST /api/chat。
+            response = await self.client.chat(
+                model=self.model,
+                messages=[{"role": "user", "content": message}],
+                # False 代表等待完整 JSON 回覆，不逐段串流。
+                stream=False,
+            )
+        except httpx.TimeoutException as error:
+            # Ollama 套件底層使用 HTTPX，因此逾時會拋出 HTTPX 例外。
+            raise LLMServiceError("Ollama 回應逾時，請稍後再試。") from error
+        except ResponseError as error:
+            # ResponseError 代表 Ollama API 回傳 4xx 或 5xx 等錯誤。
+            status_code = getattr(error, "status_code", None)
+            status_text = str(status_code) if status_code is not None else "未知"
+            raise LLMServiceError(
+                f"Ollama API 回傳錯誤狀態：{status_text}。"
+            ) from error
+        except httpx.RequestError as error:
+            # 包含服務未啟動、網址錯誤或網路連線失敗。
+            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error
+
+        request_duration = time.perf_counter() - started_at
+        # 舊版套件回傳 dict，新版則回傳物件；_read_field 同時支援兩種。
+        message_data = _read_field(response, "message")
+        content = _read_field(message_data, "content")
+
+        if not isinstance(content, str) or not content.strip():
+            raise LLMServiceError("Ollama 回傳內容缺少 message.content。")
+
+        # 解析 Ollama 回傳的效能與 Token 統計。
+        usage = LLMUsage(
+            request_duration_seconds=request_duration,
+            total_duration_ns=_optional_int(_read_field(response, "total_duration")),
+            load_duration_ns=_optional_int(_read_field(response, "load_duration")),
+            prompt_tokens=_optional_int(_read_field(response, "prompt_eval_count")),
+            completion_tokens=_optional_int(_read_field(response, "eval_count")),
+        )
+
+        # 日誌只記錄模型和統計，不記錄使用者問題或模型回答。
+        logger.info(
+            "Ollama 推論完成 model=%s request_seconds=%.3f total_duration_ns=%s "
+            "load_duration_ns=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s",
+            self.model,
+            usage.request_duration_seconds,
+            usage.total_duration_ns,
+            usage.load_duration_ns,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+        )
+
+        return LLMResponse(content=content.strip(), usage=usage)
+
+
+def _read_field(value: object, field: str) -> object:
+    """讀取舊版字典回應或新版 Ollama 回應物件的欄位。"""
+
+    if isinstance(value, Mapping):  # 支援 ollama 0.3.x 的字典回應。
+        return value.get(field)
+    # 支援較新版 Ollama 套件的 ChatResponse / Message 物件。
+    return getattr(value, field, None)
+
+
+def _optional_int(value: object) -> int | None:
+    """只接受 Ollama 正常回傳的整數統計值。"""
+
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
