@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-import logging
-import time
-from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+import logging  # 記錄模型名稱、推論時間與 Token 數量。
+import time  # 使用高精度計時器測量 Python 實際等待時間。
+from dataclasses import dataclass  # 建立只保存資料的回覆與統計類別。
+from typing import Any, Mapping, Protocol  # 描述回應型別與可替換的 Client 介面。
 
-import httpx
-from ollama import AsyncClient, ResponseError
+import httpx  # Ollama 套件底層連線及逾時錯誤的型別來源。
+from ollama import AsyncClient, ResponseError  # Ollama 官方非同步 Client 與 API 錯誤。
 
 
 # Ollama 本機服務的預設網址，以及這個專案固定使用的模型。
-DEFAULT_OLLAMA_HOST = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"  # 沒有傳入 host 時使用本機 Ollama。
+DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"  # 沒有傳入 model 時使用專案預設模型。
 
 # 使用 Python logging 記錄統計，不使用 print，方便未來統一管理日誌。
 logger = logging.getLogger(__name__)
@@ -76,8 +76,8 @@ class LLMService:
         client: OllamaClientProtocol | None = None,
     ) -> None:
         # 環境變數統一由 config.py 讀取；服務只接受傳入值或使用預設值。
-        self.host = (host or DEFAULT_OLLAMA_HOST).rstrip("/")
-        self.model = model or DEFAULT_OLLAMA_MODEL
+        self.host = (host or DEFAULT_OLLAMA_HOST).rstrip("/")  # 避免網址結尾重複出現 /。
+        self.model = model or DEFAULT_OLLAMA_MODEL  # 保存每次 chat() 要傳給 Ollama 的模型名。
         # 測試時可以注入 Fake Client；正式執行則建立官方 AsyncClient。
         self.client = client or AsyncClient(host=self.host, timeout=timeout)
 
@@ -108,7 +108,7 @@ class LLMService:
             # 包含服務未啟動、網址錯誤或網路連線失敗。
             raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error
 
-        request_duration = time.perf_counter() - started_at
+        request_duration = time.perf_counter() - started_at  # 結束時間減開始時間即經過秒數。
         # 舊版套件回傳 dict，新版則回傳物件；_read_field 同時支援兩種。
         message_data = _read_field(response, "message")
         content = _read_field(message_data, "content")
@@ -138,7 +138,7 @@ class LLMService:
             usage.total_tokens,
         )
 
-        return LLMResponse(content=content.strip(), usage=usage)
+        return LLMResponse(content=content.strip(), usage=usage)  # 將文字與統計一起交給 Bot。
 
 
 def _read_field(value: object, field: str) -> object:

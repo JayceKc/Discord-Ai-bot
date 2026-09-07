@@ -1,6 +1,6 @@
-import unittest
+import unittest  # Python 內建單元測試框架。
 
-import httpx
+import httpx  # 建立假的連線錯誤與逾時錯誤。
 
 from services.llm_service import LLMService, LLMServiceError
 
@@ -13,14 +13,14 @@ class FakeOllamaClient:
         self.response = response
         self.error = error
         # 保存每次 chat() 收到的參數，讓測試可以檢查請求內容。
-        self.calls = []
+        self.calls = []  # 每個元素會保存一次 chat() 收到的關鍵字參數。
 
     async def chat(self, **kwargs):
         # 介面保持 async，才能替代正式的 ollama.AsyncClient.chat()。
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
-        return self.response
+        return self.response  # 沒有指定錯誤時回傳準備好的 Fake Response。
 
 
 class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
