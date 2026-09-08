@@ -10,7 +10,18 @@ from discord import app_commands  # 處理 /help 這類斜線指令。
 from discord.ext import commands  # 處理 !hello、!ask 這類文字指令。
 
 from config import Settings, configure_logging, load_settings  # 載入集中管理的程式設定。
+from models.project import Project
+from repositories.guild_project_store import JsonGuildProjectStore
+from repositories.project_repository import (
+    JsonProjectRepository,
+    ProjectRepository,
+    ProjectRepositoryError,
+)
 from services.llm_service import LLMResponse, LLMService, LLMServiceError  # 載入 Ollama 服務。
+from services.project_meeting_service import (
+    ProjectMeetingError,
+    ProjectMeetingService,
+)
 
 
 logger = logging.getLogger(__name__)  # 使用模組名稱建立日誌，不記錄 Discord Token。
@@ -22,6 +33,13 @@ class ChatService(Protocol):
 
     async def chat(self, message: str) -> LLMResponse:
         """接收問題並回傳模型回答。"""
+
+
+class MeetingService(Protocol):
+    """Bot 啟動專案會議時依賴的最小介面。"""
+
+    async def start_project(self, guild_id: int, project_id: str) -> Project:
+        """啟動 Guild 的指定專案並回傳更新後資料。"""
 
 
 class MyBot(commands.Bot):
@@ -43,8 +61,34 @@ def truncate_answer(answer: str, max_length: int) -> str:
     return answer[:content_length] + TRUNCATION_SUFFIX  # 取前段回答再接上提示。
 
 
-def create_bot(settings: Settings, llm_service: ChatService) -> MyBot:
-    """使用外部傳入的設定與 LLM Service 建立 Bot，方便正式執行和測試。"""
+def format_project(project: Project) -> str:
+    """把 Project 轉成適合放進 Discord Embed 欄位的文字。"""
+
+    requirements = "、".join(project.requirements)
+    acceptance = "、".join(project.acceptance_criteria)
+    change_summary = (
+        f"{len(project.requirement_changes)} 筆"
+        if project.requirement_changes
+        else "無"
+    )
+    return (
+        f"**類別：** {project.category}\n"
+        f"**需求：** {requirements}\n"
+        f"**預算：** NT$ {project.budget:,}\n"
+        f"**期限：** {project.deadline.isoformat()}\n"
+        f"**狀態：** {project.status.label}\n"
+        f"**驗收：** {acceptance}\n"
+        f"**需求變更：** {change_summary}"
+    )
+
+
+def create_bot(
+    settings: Settings,
+    llm_service: ChatService,
+    project_repository: ProjectRepository,
+    meeting_service: MeetingService,
+) -> MyBot:
+    """使用外部傳入的設定與服務建立 Bot，方便正式執行和測試。"""
 
     intents = discord.Intents.default()  # 建立 Discord 預設事件權限。
     intents.message_content = True  # !hello 與 !ask 都需要讀取訊息內容。
@@ -59,6 +103,20 @@ def create_bot(settings: Settings, llm_service: ChatService) -> MyBot:
         """回覆並標記執行指令的使用者。"""
 
         await ctx.send(f"你好，{ctx.author.mention}！")  # mention 會在 Discord 標記該使用者。
+
+    @bot.tree.command(name="hello", description="讓機器人向你打招呼")
+    async def slash_hello(interaction: discord.Interaction) -> None:
+        """示範 Slash Command 的 defer 與 Followup 回覆流程。"""
+
+        # 先回應 Discord，避免較久的工作讓 Interaction 在三秒內逾時。
+        # thinking=True 會顯示「機器人正在思考」，ephemeral=True 代表只有本人看得到。
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        # defer() 已經使用第一次 Interaction 回應，後續訊息必須改用 followup。
+        await interaction.followup.send(
+            f"你好，{interaction.user.mention}！",
+            ephemeral=True,
+        )
 
     @bot.command(name="ask")  # 註冊 !ask 文字指令。
     async def ask(ctx: commands.Context, *, question: str) -> None:
@@ -98,15 +156,99 @@ def create_bot(settings: Settings, llm_service: ChatService) -> MyBot:
             color=discord.Color.green(),
         )
         embed.add_field(name="/help", value="顯示這份 Embed 指令說明。", inline=False)
+        embed.add_field(
+            name="/hello",
+            value="使用 Slash Command 讓機器人向你打招呼。",
+            inline=False,
+        )
         embed.add_field(name="!hello", value="讓機器人跟你打招呼。", inline=False)
         embed.add_field(
             name="!ask <問題>",
             value="將問題交給本機 Qwen 模型回答。",
             inline=False,
         )
+        embed.add_field(
+            name="/projects",
+            value="顯示目前的專案清單。",
+            inline=False,
+        )
+        embed.add_field(
+            name="/start <project_id>",
+            value="啟動指定專案的會議。",
+            inline=False,
+        )
         embed.set_footer(text=f"查詢者：{interaction.user.display_name}")  # 顯示查詢者名稱。
         # ephemeral=True 代表只有執行 /help 的使用者看得到訊息。
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="projects", description="顯示目前的專案清單")
+    async def projects_command(interaction: discord.Interaction) -> None:
+        """從 Repository 取得專案，再使用 Embed 顯示在 Discord。"""
+
+        try:
+            projects = project_repository.list_projects()
+        except ProjectRepositoryError as error:
+            logger.error("讀取專案資料失敗：%s", error)
+            await interaction.response.send_message(
+                "❌ 無法讀取專案資料，請稍後再試。",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="📁 專案清單",
+            description=f"目前共有 {len(projects)} 個專案。",
+            color=discord.Color.blue(),
+        )
+        for project in projects:
+            embed.add_field(
+                name=f"{project.id}｜{project.title}",
+                value=format_project(project),
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        logger.info("已顯示 %s 個專案", len(projects))
+
+    @bot.tree.command(name="start", description="啟動指定專案的會議")
+    @app_commands.describe(project_id="要啟動的專案 ID，例如 PRJ-001")
+    async def start_command(
+        interaction: discord.Interaction,
+        project_id: str,
+    ) -> None:
+        """驗證 Guild 和專案 ID，啟動後顯示專案狀態。"""
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ /start 只能在 Discord 伺服器中使用。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        try:
+            project = await meeting_service.start_project(
+                interaction.guild_id,
+                project_id,
+            )
+        except ProjectMeetingError as error:
+            logger.warning("/start 失敗 guild_id=%s：%s", interaction.guild_id, error)
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="✅ 專案會議已啟動",
+            description=f"{project.id}｜{project.title}",
+            color=discord.Color.green(),
+        )
+        embed.add_field(name="狀態", value=project.status.label, inline=True)
+        embed.add_field(name="期限", value=project.deadline.isoformat(), inline=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        logger.info(
+            "專案會議已啟動 guild_id=%s project_id=%s",
+            interaction.guild_id,
+            project.id,
+        )
 
     @bot.event
     async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
@@ -167,7 +309,18 @@ def main() -> None:
         model=settings.ollama_model,
         timeout=settings.ollama_timeout_seconds,
     )
-    bot = create_bot(settings, llm_service)  # 將設定和服務注入 Discord Bot。
+    project_repository = JsonProjectRepository(settings.projects_file)
+    guild_project_store = JsonGuildProjectStore(settings.guild_projects_file)
+    meeting_service = ProjectMeetingService(
+        project_repository,
+        guild_project_store,
+    )
+    bot = create_bot(
+        settings,
+        llm_service,
+        project_repository,
+        meeting_service,
+    )  # 將設定和服務注入 Discord Bot。
 
     # 日誌只顯示非敏感設定，絕對不輸出 settings.discord_token。
     logger.info(

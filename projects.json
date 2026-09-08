@@ -1,0 +1,121 @@
+{
+  "projects": [
+    {
+      "id": "PRJ-001",
+      "category": "企業網站",
+      "title": "咖啡店品牌官網",
+      "requirements": [
+        "製作響應式品牌首頁",
+        "提供菜單與門市資訊",
+        "加入聯絡表單"
+      ],
+      "budget": 80000,
+      "deadline": "2026-10-15",
+      "status": "pending",
+      "acceptance_criteria": [
+        "手機與桌面版皆可正常瀏覽",
+        "聯絡表單可以成功寄送通知"
+      ],
+      "requirement_changes": [
+        {
+          "id": "CHG-001",
+          "project_id": "PRJ-001",
+          "description": "首頁新增季節限定活動區塊",
+          "reason": "配合秋季新品上市",
+          "requested_at": "2026-09-05",
+          "status": "已核准"
+        }
+      ]
+    },
+    {
+      "id": "PRJ-002",
+      "category": "Discord Bot",
+      "title": "AI 客服機器人",
+      "requirements": [
+        "使用 Qwen 回答常見問題",
+        "支援 Slash Command",
+        "記錄錯誤與推論時間"
+      ],
+      "budget": 120000,
+      "deadline": "2026-11-30",
+      "status": "pending",
+      "acceptance_criteria": [
+        "Ollama 未啟動時顯示友善訊息",
+        "Slash Command 可在 Discord 正常使用"
+      ],
+      "requirement_changes": []
+    },
+    {
+      "id": "PRJ-003",
+      "category": "資料分析",
+      "title": "電商營運儀表板",
+      "requirements": [
+        "顯示每日訂單與營收",
+        "提供商品分類篩選",
+        "輸出月報 CSV"
+      ],
+      "budget": 150000,
+      "deadline": "2026-12-20",
+      "status": "pending",
+      "acceptance_criteria": [
+        "儀表板資料與測試資料一致",
+        "月報可以正確下載"
+      ],
+      "requirement_changes": [
+        {
+          "id": "CHG-002",
+          "project_id": "PRJ-003",
+          "description": "新增退貨率圖表",
+          "reason": "營運團隊需要追蹤商品品質",
+          "requested_at": "2026-09-07",
+          "status": "待評估"
+        }
+      ]
+    },
+    {
+      "id": "PRJ-004",
+      "category": "行動應用程式",
+      "title": "健身預約 App",
+      "requirements": [
+        "會員註冊與登入",
+        "教練課程預約",
+        "預約前推播提醒"
+      ],
+      "budget": 260000,
+      "deadline": "2027-01-31",
+      "status": "pending",
+      "acceptance_criteria": [
+        "會員可完成預約與取消",
+        "提醒通知於課程前一天送出"
+      ],
+      "requirement_changes": []
+    },
+    {
+      "id": "PRJ-005",
+      "category": "流程自動化",
+      "title": "發票整理工具",
+      "requirements": [
+        "讀取指定資料夾內的發票",
+        "依月份和廠商自動分類",
+        "產生處理結果日誌"
+      ],
+      "budget": 60000,
+      "deadline": "2026-10-31",
+      "status": "pending",
+      "acceptance_criteria": [
+        "測試發票皆分類到正確資料夾",
+        "重複檔案不會被再次處理"
+      ],
+      "requirement_changes": [
+        {
+          "id": "CHG-003",
+          "project_id": "PRJ-005",
+          "description": "增加 PDF 發票支援",
+          "reason": "供應商開始改用電子發票",
+          "requested_at": "2026-09-08",
+          "status": "已核准"
+        }
+      ]
+    }
+  ]
+}

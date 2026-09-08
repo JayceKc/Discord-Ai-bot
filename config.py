@@ -19,6 +19,8 @@ class Settings:
     ollama_timeout_seconds: float = 300.0  # 等待模型回答的最長秒數。
     max_ask_input_length: int = 500  # 使用者問題的最大字元數。
     max_ask_output_length: int = 1900  # 傳回 Discord 的最大字元數。
+    projects_file: str = "projects.json"  # JsonProjectRepository 讀取的資料檔路徑。
+    guild_projects_file: str = "guild_projects.json"  # 每個 Guild 的目前專案。
     log_level: str = "INFO"  # 預設只顯示 INFO 以上等級的日誌。
 
 
@@ -41,6 +43,8 @@ def load_settings() -> Settings:
         ollama_timeout_seconds=_read_positive_float("OLLAMA_TIMEOUT_SECONDS", 300.0),
         max_ask_input_length=_read_positive_int("MAX_ASK_INPUT_LENGTH", 500),
         max_ask_output_length=_read_positive_int("MAX_ASK_OUTPUT_LENGTH", 1900),
+        projects_file=os.getenv("PROJECTS_FILE", "projects.json"),
+        guild_projects_file=os.getenv("GUILD_PROJECTS_FILE", "guild_projects.json"),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # 統一轉成大寫，例如 info 變成 INFO。
     )
 

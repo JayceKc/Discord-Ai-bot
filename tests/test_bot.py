@@ -1,11 +1,13 @@
 """測試 Discord 指令流程；不會真的登入 Discord 或呼叫 Ollama。"""
 
 import unittest  # Python 內建單元測試框架。
+from datetime import date
 from types import SimpleNamespace  # 快速建立只具有必要欄位的假物件。
-from unittest.mock import AsyncMock  # 模擬需要 await 的 Discord 與 LLM 方法。
+from unittest.mock import AsyncMock, Mock  # 模擬 Discord、LLM 與 Repository 方法。
 
 from bot import TRUNCATION_SUFFIX, create_bot
 from config import Settings
+from models.project import Project, ProjectStatus
 from services.llm_service import LLMServiceError
 
 
@@ -16,7 +18,14 @@ class BotCommandTest(unittest.IsolatedAsyncioTestCase):
         # 測試設定使用假的 Token；create_bot 不會拿它登入 Discord。
         self.settings = Settings(discord_token="fake-discord-token")
         self.fake_service = SimpleNamespace(chat=AsyncMock())  # 不連線 Ollama 的假服務。
-        self.bot = create_bot(self.settings, self.fake_service)  # 注入假設定和假服務。
+        self.fake_project_repository = SimpleNamespace(list_projects=Mock(return_value=[]))
+        self.fake_meeting_service = SimpleNamespace(start_project=AsyncMock())
+        self.bot = create_bot(
+            self.settings,
+            self.fake_service,
+            self.fake_project_repository,
+            self.fake_meeting_service,
+        )  # 注入假設定和假服務。
 
     async def asyncTearDown(self) -> None:
         # 關閉 Bot 內部資源，避免不同測試互相影響。
@@ -34,6 +43,112 @@ class BotCommandTest(unittest.IsolatedAsyncioTestCase):
         await self.bot.get_command("hello").callback(ctx)
 
         ctx.send.assert_awaited_once_with("你好，@Jayce！")  # 驗證只傳送過一次正確訊息。
+
+    async def test_slash_hello_defers_then_sends_ephemeral_followup(self) -> None:
+        """/hello 應該先 defer，再以私密 Followup 向使用者打招呼。"""
+
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(mention="@Jayce"),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        # Slash Command 保存在 bot.tree，callback 可直接執行指令函式。
+        await self.bot.tree.get_command("hello").callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(
+            thinking=True,
+            ephemeral=True,
+        )
+        interaction.followup.send.assert_awaited_once_with(
+            "你好，@Jayce！",
+            ephemeral=True,
+        )
+
+    async def test_projects_reads_repository_and_sends_ephemeral_embed(self) -> None:
+        """/projects 應該將 Repository 的專案顯示為私密 Embed。"""
+
+        self.fake_project_repository.list_projects.return_value = [
+            Project(
+                id="PRJ-001",
+                category="Discord Bot",
+                title="AI 客服機器人",
+                requirements=("使用 Qwen 回答問題",),
+                budget=120000,
+                deadline=date(2026, 11, 30),
+                acceptance_criteria=("Slash Command 可正常使用",),
+                status=ProjectStatus.PENDING,
+            )
+        ]
+        interaction = SimpleNamespace(
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        await self.bot.tree.get_command("projects").callback(interaction)
+
+        self.fake_project_repository.list_projects.assert_called_once_with()
+        send_call = interaction.response.send_message.await_args
+        embed = send_call.kwargs["embed"]
+        self.assertTrue(send_call.kwargs["ephemeral"])
+        self.assertEqual(embed.title, "📁 專案清單")
+        self.assertEqual(embed.description, "目前共有 1 個專案。")
+        self.assertEqual(embed.fields[0].name, "PRJ-001｜AI 客服機器人")
+        self.assertIn("NT$ 120,000", embed.fields[0].value)
+
+    async def test_start_defers_and_starts_project_for_current_guild(self) -> None:
+        """/start 應將 Guild ID 與專案 ID 交給 MeetingService。"""
+
+        self.fake_meeting_service.start_project.return_value = Project(
+            id="PRJ-001",
+            category="企業網站",
+            title="咖啡店品牌官網",
+            requirements=("製作首頁",),
+            budget=80000,
+            deadline=date(2026, 10, 15),
+            acceptance_criteria=("手機版可正常瀏覽",),
+            status=ProjectStatus.IN_PROGRESS,
+        )
+        interaction = SimpleNamespace(
+            guild_id=123456,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await self.bot.tree.get_command("start").callback(
+            interaction,
+            project_id="PRJ-001",
+        )
+
+        interaction.response.defer.assert_awaited_once_with(
+            thinking=True,
+            ephemeral=True,
+        )
+        self.fake_meeting_service.start_project.assert_awaited_once_with(
+            123456,
+            "PRJ-001",
+        )
+        send_call = interaction.followup.send.await_args
+        self.assertTrue(send_call.kwargs["ephemeral"])
+        self.assertEqual(send_call.kwargs["embed"].title, "✅ 專案會議已啟動")
+
+    async def test_start_rejects_direct_message(self) -> None:
+        """私訊沒有 Guild ID，因此不能建立 Guild 專案會議。"""
+
+        interaction = SimpleNamespace(
+            guild_id=None,
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        await self.bot.tree.get_command("start").callback(
+            interaction,
+            project_id="PRJ-001",
+        )
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "❌ /start 只能在 Discord 伺服器中使用。",
+            ephemeral=True,
+        )
+        self.fake_meeting_service.start_project.assert_not_awaited()
 
     async def test_ask_shows_processing_then_returns_answer(self) -> None:
         """!ask 應該先顯示處理中，再編輯為模型回答。"""
