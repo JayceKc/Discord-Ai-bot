@@ -25,6 +25,7 @@ class FakeOllamaClient:
 
 class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
     async def test_chat_passes_agent_options_and_json_schema(self):
+        # Arrange：準備結構化輸出 Schema 與假的 Ollama 回應，避免真的啟動模型。
         schema = {
             "type": "object",
             "properties": {"summary": {"type": "string"}},
@@ -35,6 +36,7 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
         )
         service = LLMService(client=fake_client)
 
+        # Act：使用 system prompt、生成選項與 JSON Schema 呼叫服務。
         await service.chat(
             "整理需求",
             system_prompt="你是專案經理。",
@@ -44,6 +46,7 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
             json_schema=schema,
         )
 
+        # Assert：確認訊息順序、選項欄位名稱及 format 都正確傳給 Ollama。
         self.assertEqual(
             fake_client.calls,
             [{

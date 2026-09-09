@@ -90,6 +90,7 @@ class LLMService:
         started_at = time.perf_counter()  # 高精度計時器，適合測量經過時間。
 
         try:
+            # system prompt 有提供時才放在最前面，讓模型先收到角色與任務背景。
             messages: list[dict[str, str]] = []
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
@@ -100,6 +101,7 @@ class LLMService:
                 "messages": messages,
                 "stream": False,
             }
+            # 將服務層的生成參數轉成 Ollama API 使用的欄位名稱；未提供的選項不送出。
             options: dict[str, object] = {}
             if temperature is not None:
                 options["temperature"] = temperature
@@ -109,6 +111,7 @@ class LLMService:
                 options["num_predict"] = max_output_tokens
             if options:
                 request["options"] = options
+            # JSON Schema 是選用的結構化輸出限制，只有呼叫端提供時才設定 format。
             if json_schema is not None:
                 request["format"] = dict(json_schema)
 
