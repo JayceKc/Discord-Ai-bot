@@ -24,6 +24,44 @@ class FakeOllamaClient:
 
 
 class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
+    async def test_chat_passes_agent_options_and_json_schema(self):
+        schema = {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        }
+        fake_client = FakeOllamaClient(
+            response={"message": {"content": '{"summary":"完成"}'}}
+        )
+        service = LLMService(client=fake_client)
+
+        await service.chat(
+            "整理需求",
+            system_prompt="你是專案經理。",
+            temperature=0.2,
+            seed=42,
+            max_output_tokens=500,
+            json_schema=schema,
+        )
+
+        self.assertEqual(
+            fake_client.calls,
+            [{
+                "model": "qwen3.5:4b",
+                "messages": [
+                    {"role": "system", "content": "你是專案經理。"},
+                    {"role": "user", "content": "整理需求"},
+                ],
+                "stream": False,
+                "options": {
+                    "temperature": 0.2,
+                    "seed": 42,
+                    "num_predict": 500,
+                },
+                "format": schema,
+            }],
+        )
+
     async def test_chat_uses_fake_response_and_parses_content_and_usage(self):
         # Arrange：準備一份假的 Ollama 完整回應。
         fake_client = FakeOllamaClient(

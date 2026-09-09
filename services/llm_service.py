@@ -55,13 +55,7 @@ class LLMResponse:
 class OllamaClientProtocol(Protocol):
     """正式 Client 與測試 Fake Client 共用的最小介面。"""
 
-    async def chat(
-        self,
-        *,
-        model: str,
-        messages: list[dict[str, str]],
-        stream: bool,
-    ) -> Any:
+    async def chat(self, **kwargs: Any) -> Any:
         """產生一次非串流聊天回應。"""
 
 
@@ -81,19 +75,45 @@ class LLMService:
         # 測試時可以注入 Fake Client；正式執行則建立官方 AsyncClient。
         self.client = client or AsyncClient(host=self.host, timeout=timeout)
 
-    async def chat(self, message: str) -> LLMResponse:
+    async def chat(
+        self,
+        message: str,
+        *,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        seed: int | None = None,
+        max_output_tokens: int | None = None,
+        json_schema: Mapping[str, object] | None = None,
+    ) -> LLMResponse:
         """傳送單輪聊天訊息並回傳文字與使用量統計。"""
 
         started_at = time.perf_counter()  # 高精度計時器，適合測量經過時間。
 
         try:
+            messages: list[dict[str, str]] = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": message})
+
+            request: dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "stream": False,
+            }
+            options: dict[str, object] = {}
+            if temperature is not None:
+                options["temperature"] = temperature
+            if seed is not None:
+                options["seed"] = seed
+            if max_output_tokens is not None:
+                options["num_predict"] = max_output_tokens
+            if options:
+                request["options"] = options
+            if json_schema is not None:
+                request["format"] = dict(json_schema)
+
             # AsyncClient.chat 會由 Ollama 套件替我們呼叫 POST /api/chat。
-            response = await self.client.chat(
-                model=self.model,
-                messages=[{"role": "user", "content": message}],
-                # False 代表等待完整 JSON 回覆，不逐段串流。
-                stream=False,
-            )
+            response = await self.client.chat(**request)
         except httpx.TimeoutException as error:
             # Ollama 套件底層使用 HTTPX，因此逾時會拋出 HTTPX 例外。
             raise LLMServiceError("Ollama 回應逾時，請稍後再試。") from error
