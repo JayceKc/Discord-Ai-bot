@@ -5,6 +5,11 @@ from .guild_project_store import (
     GuildProjectStoreError,
     JsonGuildProjectStore,
 )
+from .meeting_repository import (
+    JsonMeetingRepository,
+    MeetingRepository,
+    MeetingRepositoryError,
+)
 from .project_repository import (
     JsonProjectRepository,
     ProjectRepository,
@@ -15,7 +20,10 @@ __all__ = [
     "GuildProjectStore",
     "GuildProjectStoreError",
     "JsonGuildProjectStore",
+    "JsonMeetingRepository",
     "JsonProjectRepository",
+    "MeetingRepository",
+    "MeetingRepositoryError",
     "ProjectRepository",
     "ProjectRepositoryError",
 ]
