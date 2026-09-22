@@ -21,6 +21,10 @@ class Settings:
     max_ask_output_length: int = 1900  # 傳回 Discord 的最大字元數。
     projects_file: str = "projects.json"  # JsonProjectRepository 讀取的資料檔路徑。
     guild_projects_file: str = "guild_projects.json"  # 每個 Guild 的目前專案。
+    meetings_file: str = "meetings.json"  # 保存每場 Agent 會議與發言內容。
+    max_meeting_message_length: int = 1900  # 每段會議訊息保留 Discord 安全空間。
+    max_meeting_prompt_length: int = 6000  # 單次傳給 Agent 的共享內容字元預算。
+    max_meeting_response_length: int = 4000  # 單一 Agent 結構化回覆字元預算。
     log_level: str = "INFO"  # 預設只顯示 INFO 以上等級的日誌。
 
 
@@ -45,6 +49,19 @@ def load_settings() -> Settings:
         max_ask_output_length=_read_positive_int("MAX_ASK_OUTPUT_LENGTH", 1900),
         projects_file=os.getenv("PROJECTS_FILE", "projects.json"),
         guild_projects_file=os.getenv("GUILD_PROJECTS_FILE", "guild_projects.json"),
+        meetings_file=os.getenv("MEETINGS_FILE", "meetings.json"),
+        max_meeting_message_length=_read_positive_int(
+            "MAX_MEETING_MESSAGE_LENGTH",
+            1900,
+        ),
+        max_meeting_prompt_length=_read_positive_int(
+            "MAX_MEETING_PROMPT_LENGTH",
+            6000,
+        ),
+        max_meeting_response_length=_read_positive_int(
+            "MAX_MEETING_RESPONSE_LENGTH",
+            4000,
+        ),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # 統一轉成大寫，例如 info 變成 INFO。
     )
 

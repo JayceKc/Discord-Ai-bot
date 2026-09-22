@@ -73,6 +73,18 @@ class RequirementChange:
     requested_at: date  # 提出日期。
     status: str  # 目前狀態，例如待評估、已核准或已完成。
 
+    def to_dict(self) -> dict[str, str]:
+        """轉成會議紀錄與 JSON Repository 可以保存的格式。"""
+
+        return {
+            "id": self.id,
+            "project_id": self.project_id,
+            "description": self.description,
+            "reason": self.reason,
+            "requested_at": self.requested_at.isoformat(),
+            "status": self.status,
+        }
+
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "RequirementChange":
         """將 JSON 字典轉成 RequirementChange，並驗證必要欄位。"""

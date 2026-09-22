@@ -100,6 +100,9 @@ class LLMService:
                 "model": self.model,
                 "messages": messages,
                 "stream": False,
+                # Qwen3.5 預設會先產生 thinking；關閉後可避免有限的
+                # num_predict 全被思考內容用完，導致 message.content 為空。
+                "think": False,
             }
             # 將服務層的生成參數轉成 Ollama API 使用的欄位名稱；未提供的選項不送出。
             options: dict[str, object] = {}
@@ -127,6 +130,9 @@ class LLMService:
             raise LLMServiceError(
                 f"Ollama API 回傳錯誤狀態：{status_text}。"
             ) from error
+        except ConnectionError as error:
+            # 新版 Ollama Python 在服務未啟動時會包裝成內建 ConnectionError。
+            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error
         except httpx.RequestError as error:
             # 包含服務未啟動、網址錯誤或網路連線失敗。
             raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error

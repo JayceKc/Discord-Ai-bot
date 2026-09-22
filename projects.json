@@ -11,7 +11,7 @@
       ],
       "budget": 80000,
       "deadline": "2026-10-15",
-      "status": "pending",
+      "status": "in_progress",
       "acceptance_criteria": [
         "手機與桌面版皆可正常瀏覽",
         "聯絡表單可以成功寄送通知"
@@ -38,12 +38,21 @@
       ],
       "budget": 120000,
       "deadline": "2026-11-30",
-      "status": "pending",
+      "status": "in_progress",
       "acceptance_criteria": [
         "Ollama 未啟動時顯示友善訊息",
         "Slash Command 可在 Discord 正常使用"
       ],
-      "requirement_changes": []
+      "requirement_changes": [
+        {
+          "id": "CHG-004",
+          "project_id": "PRJ-002",
+          "description": "專案預算縮減 20%，優先保留核心問答與 Slash Command",
+          "reason": "客戶臨時調整本季開發預算",
+          "requested_at": "2026-09-17",
+          "status": "待評估"
+        }
+      ]
     },
     {
       "id": "PRJ-003",
@@ -56,7 +65,7 @@
       ],
       "budget": 150000,
       "deadline": "2026-12-20",
-      "status": "pending",
+      "status": "in_progress",
       "acceptance_criteria": [
         "儀表板資料與測試資料一致",
         "月報可以正確下載"
@@ -88,7 +97,16 @@
         "會員可完成預約與取消",
         "提醒通知於課程前一天送出"
       ],
-      "requirement_changes": []
+      "requirement_changes": [
+        {
+          "id": "CHG-005",
+          "project_id": "PRJ-004",
+          "description": "上線期限提前兩週，第一版延後推播提醒功能",
+          "reason": "需要配合健身房開幕日期",
+          "requested_at": "2026-09-17",
+          "status": "待評估"
+        }
+      ]
     },
     {
       "id": "PRJ-005",
@@ -101,7 +119,7 @@
       ],
       "budget": 60000,
       "deadline": "2026-10-31",
-      "status": "pending",
+      "status": "completed",
       "acceptance_criteria": [
         "測試發票皆分類到正確資料夾",
         "重複檔案不會被再次處理"

@@ -3,21 +3,32 @@
 from __future__ import annotations
 
 import logging  # 記錄 Bot 上線、指令執行與錯誤狀態。
+import json  # 將 Agent 的結構化輸出整理成 Discord 可讀文字。
+import time  # 顯示 Agent 與 PM 整合草案的實際處理時間。
 from typing import Protocol  # 定義 Bot 需要的 LLM 服務介面。
 
 import discord  # Discord API 的主要型別與 Embed 功能。
 from discord import app_commands  # 處理 /help 這類斜線指令。
 from discord.ext import commands  # 處理 !hello、!ask 這類文字指令。
 
+from agents import CreativeAgent, FinanceAgent, PMAgent, ResearchAgent, ReviewAgent
 from config import Settings, configure_logging, load_settings  # 載入集中管理的程式設定。
-from models.project import Project
+from models.meeting import MeetingRecord, MeetingStepRecord, ProposalMetrics
+from models.project import Project, RequirementChange
 from repositories.guild_project_store import JsonGuildProjectStore
+from repositories.meeting_repository import JsonMeetingRepository
 from repositories.project_repository import (
     JsonProjectRepository,
     ProjectRepository,
     ProjectRepositoryError,
 )
 from services.llm_service import LLMResponse, LLMService, LLMServiceError  # 載入 Ollama 服務。
+from services.meeting_manager import (
+    MeetingManager,
+    MeetingManagerError,
+    MeetingStepCallback,
+    ReviewWorkflowResult,
+)
 from services.project_meeting_service import (
     ProjectMeetingError,
     ProjectMeetingService,
@@ -26,6 +37,12 @@ from services.project_meeting_service import (
 
 logger = logging.getLogger(__name__)  # 使用模組名稱建立日誌，不記錄 Discord Token。
 TRUNCATION_SUFFIX = "\n\n…（回覆過長，已截斷）"  # 模型回答太長時加在結尾。
+AGENT_TITLES = {
+    "PM Agent": "PM 需求拆解",
+    "Research Agent": "Research 研究觀點",
+    "Creative Agent": "Creative 創意提案",
+    "Finance Agent": "Finance 財務評估",
+}
 
 
 class ChatService(Protocol):
@@ -40,6 +57,41 @@ class MeetingService(Protocol):
 
     async def start_project(self, guild_id: int, project_id: str) -> Project:
         """啟動 Guild 的指定專案並回傳更新後資料。"""
+
+
+class DiscussionManager(Protocol):
+    """Bot 執行多輪 Agent 討論時需要的最小介面。"""
+
+    async def start_first_round(
+        self,
+        guild_id: int,
+        project_id: str,
+        requirement: str,
+        *,
+        on_step: MeetingStepCallback | None = None,
+    ) -> MeetingRecord:
+        """執行第一輪並在每位 Agent 完成時回報。"""
+
+    async def start_second_round(
+        self,
+        guild_id: int,
+        requirement_change: RequirementChange,
+        *,
+        on_step: MeetingStepCallback | None = None,
+    ) -> MeetingRecord:
+        """套用一次需求變更並執行第二輪。"""
+
+    async def create_proposal_draft(self, guild_id: int) -> dict[str, object]:
+        """建立或讀取 PM 整合草案。"""
+
+    def get_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
+        """取得已保存的 PM 草案使用量統計。"""
+
+    async def review_and_finalize(self, guild_id: int) -> ReviewWorkflowResult:
+        """審查草案、執行至多一次修改並產生最終方案。"""
+
+    def get_final_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
+        """取得最終方案的 PM 使用量統計。"""
 
 
 class MyBot(commands.Bot):
@@ -59,6 +111,123 @@ def truncate_answer(answer: str, max_length: int) -> str:
     # 先保留截斷提示需要的空間，確保組合後仍不超過 max_length。
     content_length = max_length - len(TRUNCATION_SUFFIX)
     return answer[:content_length] + TRUNCATION_SUFFIX  # 取前段回答再接上提示。
+
+
+def split_discord_message(content: str, max_length: int) -> list[str]:
+    """將完整內容切成多段，優先在換行處分割且不遺失文字。"""
+
+    if max_length <= 0:
+        raise ValueError("Discord 訊息長度必須大於 0。")
+
+    remaining = content
+    chunks: list[str] = []
+    while len(remaining) > max_length:
+        split_at = remaining.rfind("\n", 0, max_length + 1)
+        if split_at <= 0:
+            split_at = max_length
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+        if remaining.startswith("\n"):
+            remaining = remaining[1:]
+    if remaining or not chunks:
+        chunks.append(remaining)
+    return chunks
+
+
+def format_discussion_messages(
+    agent_name: str,
+    current: int,
+    total: int,
+    output_data: dict[str, object],
+    *,
+    max_length: int,
+    round_number: int | None = None,
+    execution_time_seconds: float | None = None,
+    input_characters: int | None = None,
+    output_characters: int | None = None,
+    max_prompt_characters: int | None = None,
+    max_response_characters: int | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    max_output_tokens: int | None = None,
+) -> list[str]:
+    """將 Agent 結構化輸出轉成帶進度、符合 Discord 上限的訊息。"""
+
+    title = AGENT_TITLES.get(agent_name, agent_name)
+    round_label = f"第 {round_number} 輪 " if round_number is not None else ""
+    time_label = (
+        f"（{execution_time_seconds:.2f} 秒）"
+        if execution_time_seconds is not None
+        else ""
+    )
+    usage_parts: list[str] = []
+    if input_characters is not None:
+        usage_parts.append(
+            _format_limit_usage(
+                "輸入",
+                input_characters,
+                max_prompt_characters,
+                "字元",
+            )
+        )
+    if output_characters is not None:
+        usage_parts.append(
+            _format_limit_usage(
+                "輸出",
+                output_characters,
+                max_response_characters,
+                "字元",
+            )
+        )
+    if prompt_tokens is not None:
+        usage_parts.append(f"Prompt Token {prompt_tokens:,}")
+    if completion_tokens is not None:
+        usage_parts.append(
+            _format_limit_usage(
+                "輸出 Token",
+                completion_tokens,
+                max_output_tokens,
+                "",
+            )
+        )
+    usage_line = f"📊 {'｜'.join(usage_parts)}\n" if usage_parts else ""
+    first_header = (
+        f"**{round_label}{current}/{total} {title}{time_label}**\n{usage_line}"
+    )
+    continuation_header = (
+        f"**{round_label}{current}/{total} {title}（續）{time_label}**\n"
+    )
+    reserved_length = max(len(first_header), len(continuation_header))
+    if max_length <= reserved_length:
+        raise ValueError("Discord 訊息上限不足以放入進度標題。")
+
+    # ensure_ascii=False 讓中文直接顯示；縮排可保留結構化輸出的層次。
+    body = json.dumps(output_data, ensure_ascii=False, indent=2)
+    chunks = split_discord_message(body, max_length - reserved_length)
+    return [
+        (first_header if index == 0 else continuation_header) + chunk
+        for index, chunk in enumerate(chunks)
+    ]
+
+
+def _format_limit_usage(
+    label: str,
+    value: int,
+    limit: int | None,
+    unit: str,
+) -> str:
+    """顯示用量；達上限 80% 警告，95% 顯示高風險。"""
+
+    suffix = f" {unit}" if unit else ""
+    if limit is None or limit <= 0:
+        return f"{label} {value:,}{suffix}"
+
+    ratio = value / limit
+    warning = "🚨 " if ratio >= 0.95 else "⚠️ " if ratio >= 0.80 else ""
+    return (
+        f"{warning}{label} {value:,}/{limit:,}{suffix}"
+        f"（{ratio:.1%}）"
+    )
 
 
 def format_project(project: Project) -> str:
@@ -82,11 +251,138 @@ def format_project(project: Project) -> str:
     )
 
 
+def format_proposal_embed(
+    proposal: dict[str, object],
+    *,
+    execution_time_seconds: float | None = None,
+    metrics: ProposalMetrics | None = None,
+    max_prompt_characters: int | None = None,
+    max_response_characters: int | None = None,
+) -> discord.Embed:
+    """將 PM 整合草案濃縮成適合 Discord 顯示的 Embed。"""
+
+    title = str(proposal.get("title", "PM 整合草案"))[:250]
+    summary = str(proposal.get("summary", "尚無摘要"))[:4000]
+    raw_decisions = proposal.get("decisions", [])
+    decisions = raw_decisions if isinstance(raw_decisions, list) else []
+    counts = {"採用": 0, "拒絕": 0, "折衷": 0}
+    decision_lines: list[str] = []
+    for item in decisions:
+        if not isinstance(item, dict):
+            continue
+        decision = str(item.get("decision", ""))
+        if decision in counts:
+            counts[decision] += 1
+        topic = str(item.get("topic", "未命名決策"))
+        reason = str(item.get("reason", ""))
+        decision_lines.append(f"• **{decision}｜{topic}**：{reason}")
+
+    embed = discord.Embed(
+        title=f"📄 {title}",
+        description=summary,
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="決策統計",
+        value=(
+            f"採用 {counts['採用']}｜拒絕 {counts['拒絕']}｜"
+            f"折衷 {counts['折衷']}"
+        ),
+        inline=False,
+    )
+    decision_text = "\n".join(decision_lines[:5]) or "尚無決策紀錄。"
+    embed.add_field(
+        name="主要決策",
+        value=decision_text[:1024],
+        inline=False,
+    )
+    footer = "完整章節與決策已保存至會議紀錄。"
+    if metrics is not None:
+        usage_parts = [
+            _format_limit_usage(
+                "輸入",
+                metrics.input_characters,
+                max_prompt_characters,
+                "字元",
+            ),
+            _format_limit_usage(
+                "輸出",
+                metrics.output_characters,
+                max_response_characters,
+                "字元",
+            ),
+        ]
+        if metrics.prompt_tokens is not None:
+            usage_parts.append(f"Prompt Token {metrics.prompt_tokens:,}")
+        if metrics.completion_tokens is not None:
+            usage_parts.append(
+                _format_limit_usage(
+                    "輸出 Token",
+                    metrics.completion_tokens,
+                    metrics.max_output_tokens,
+                    "",
+                )
+            )
+        footer += " " + "｜".join(usage_parts) + "。"
+        footer += f" 處理耗時 {metrics.execution_time_seconds:.2f} 秒。"
+    elif execution_time_seconds is not None:
+        footer += f" 本次處理耗時 {execution_time_seconds:.2f} 秒。"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def format_review_embed(review: dict[str, object]) -> discord.Embed:
+    """將四項審查、修改要求與指定負責人顯示成 Discord Embed。"""
+
+    status = str(review.get("status", "未知"))
+    passed = status == "通過"
+    embed = discord.Embed(
+        title=f"{'✅' if passed else '🛠️'} Review 審查：{status}",
+        color=discord.Color.green() if passed else discord.Color.orange(),
+    )
+    checklist = review.get("checklist", {})
+    checklist_names = {
+        "completeness": "完整度",
+        "creativity": "創意",
+        "credibility": "可信度",
+        "feasibility": "可行性",
+    }
+    if isinstance(checklist, dict):
+        lines: list[str] = []
+        for key, label in checklist_names.items():
+            item = checklist.get(key)
+            if not isinstance(item, dict):
+                continue
+            icon = "✅" if item.get("passed") is True else "❌"
+            lines.append(f"{icon} **{label}**：{item.get('reason', '')}")
+        embed.description = "\n".join(lines)[:4000]
+
+    raw_issues = review.get("issues", [])
+    issues = raw_issues if isinstance(raw_issues, list) else []
+    issue_lines = [
+        (
+            f"• **{item.get('priority', '未定')}｜"
+            f"{item.get('assigned_agent', '未指定')}**\n"
+            f"問題：{item.get('problem', '')}\n"
+            f"要求：{item.get('required_change', '')}"
+        )
+        for item in issues
+        if isinstance(item, dict)
+    ]
+    embed.add_field(
+        name="修改要求",
+        value=("\n\n".join(issue_lines) or "無，草案可以直接通過。")[:1024],
+        inline=False,
+    )
+    return embed
+
+
 def create_bot(
     settings: Settings,
     llm_service: ChatService,
     project_repository: ProjectRepository,
     meeting_service: MeetingService,
+    discussion_manager: DiscussionManager,
 ) -> MyBot:
     """使用外部傳入的設定與服務建立 Bot，方便正式執行和測試。"""
 
@@ -177,6 +473,21 @@ def create_bot(
             value="啟動指定專案的會議。",
             inline=False,
         )
+        embed.add_field(
+            name="/change <change_id>",
+            value="套用一次需求變更並開始第二輪討論。",
+            inline=False,
+        )
+        embed.add_field(
+            name="/draft",
+            value="由 PM 將兩輪討論整合成提案草案。",
+            inline=False,
+        )
+        embed.add_field(
+            name="/review",
+            value="審查草案、至多修改一次，再由 PM 產生最終方案。",
+            inline=False,
+        )
         embed.set_footer(text=f"查詢者：{interaction.user.display_name}")  # 顯示查詢者名稱。
         # ephemeral=True 代表只有執行 /help 的使用者看得到訊息。
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -225,7 +536,8 @@ def create_bot(
             )
             return
 
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        # 第一輪發言需要讓伺服器成員看見，因此使用公開的 defer 與 Followup。
+        await interaction.response.defer(thinking=True)
         try:
             project = await meeting_service.start_project(
                 interaction.guild_id,
@@ -233,7 +545,7 @@ def create_bot(
             )
         except ProjectMeetingError as error:
             logger.warning("/start 失敗 guild_id=%s：%s", interaction.guild_id, error)
-            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            await interaction.followup.send(f"❌ {error}")
             return
 
         embed = discord.Embed(
@@ -243,11 +555,245 @@ def create_bot(
         )
         embed.add_field(name="狀態", value=project.status.label, inline=True)
         embed.add_field(name="期限", value=project.deadline.isoformat(), inline=True)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed)
+
+        async def display_agent_step(
+            current: int,
+            total: int,
+            step: MeetingStepRecord,
+        ) -> None:
+            """每位 Agent 完成後，立即把進度與完整發言送到 Discord。"""
+
+            output_data = step.output_data or {}
+            messages = format_discussion_messages(
+                step.agent_name,
+                current,
+                total,
+                output_data,
+                max_length=settings.max_meeting_message_length,
+                execution_time_seconds=step.execution_time_seconds,
+                input_characters=step.input_characters,
+                output_characters=step.output_characters,
+                max_prompt_characters=settings.max_meeting_prompt_length,
+                max_response_characters=settings.max_meeting_response_length,
+                prompt_tokens=step.prompt_tokens,
+                completion_tokens=step.completion_tokens,
+                max_output_tokens=step.max_output_tokens,
+            )
+            for message in messages:
+                await interaction.followup.send(message)
+
+        requirement = "\n".join(project.requirements)
+        try:
+            await discussion_manager.start_first_round(
+                interaction.guild_id,
+                project.id,
+                requirement,
+                on_step=display_agent_step,
+            )
+        except MeetingManagerError as error:
+            logger.warning(
+                "第一輪討論失敗 guild_id=%s project_id=%s：%s",
+                interaction.guild_id,
+                project.id,
+                error,
+            )
+            await interaction.followup.send(f"❌ 第一輪討論失敗：{error}")
+            return
+
+        await interaction.followup.send("✅ 第一輪討論完成。")
         logger.info(
-            "專案會議已啟動 guild_id=%s project_id=%s",
+            "第一輪討論完成 guild_id=%s project_id=%s",
             interaction.guild_id,
             project.id,
+        )
+
+    @bot.tree.command(name="change", description="套用需求變更並開始第二輪討論")
+    @app_commands.describe(change_id="需求變更 ID，例如 CHG-001")
+    async def change_command(
+        interaction: discord.Interaction,
+        change_id: str,
+    ) -> None:
+        """尋找指定需求變更，讓四位 Agent 各完成一次第二輪回應。"""
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ /change 只能在 Discord 伺服器中使用。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        normalized_change_id = change_id.strip().upper()
+        try:
+            projects = project_repository.list_projects()
+        except ProjectRepositoryError as error:
+            logger.error("讀取需求變更失敗：%s", error)
+            await interaction.followup.send("❌ 無法讀取需求變更資料，請稍後再試。")
+            return
+
+        requirement_change = next(
+            (
+                change
+                for project in projects
+                for change in project.requirement_changes
+                if change.id.upper() == normalized_change_id
+            ),
+            None,
+        )
+        if requirement_change is None:
+            await interaction.followup.send(
+                f"❌ 找不到需求變更 ID：{normalized_change_id}。"
+            )
+            return
+
+        await interaction.followup.send(
+            "🔄 套用需求變更 "
+            f"{requirement_change.id}：{requirement_change.description}\n"
+            f"原因：{requirement_change.reason}"
+        )
+
+        async def display_second_round_step(
+            current: int,
+            total: int,
+            step: MeetingStepRecord,
+        ) -> None:
+            output_data = step.output_data or {}
+            messages = format_discussion_messages(
+                step.agent_name,
+                current,
+                total,
+                output_data,
+                max_length=settings.max_meeting_message_length,
+                round_number=2,
+                execution_time_seconds=step.execution_time_seconds,
+                input_characters=step.input_characters,
+                output_characters=step.output_characters,
+                max_prompt_characters=settings.max_meeting_prompt_length,
+                max_response_characters=settings.max_meeting_response_length,
+                prompt_tokens=step.prompt_tokens,
+                completion_tokens=step.completion_tokens,
+                max_output_tokens=step.max_output_tokens,
+            )
+            for message in messages:
+                await interaction.followup.send(message)
+
+        try:
+            await discussion_manager.start_second_round(
+                interaction.guild_id,
+                requirement_change,
+                on_step=display_second_round_step,
+            )
+        except MeetingManagerError as error:
+            logger.warning(
+                "第二輪討論失敗 guild_id=%s change_id=%s：%s",
+                interaction.guild_id,
+                normalized_change_id,
+                error,
+            )
+            await interaction.followup.send(f"❌ 第二輪討論失敗：{error}")
+            return
+
+        await interaction.followup.send("✅ 第二輪討論完成。")
+
+    @bot.tree.command(name="draft", description="由 PM 整合兩輪討論並顯示提案摘要")
+    async def draft_command(interaction: discord.Interaction) -> None:
+        """建立固定格式提案，保存決策並在 Discord 顯示摘要。"""
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ /draft 只能在 Discord 伺服器中使用。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        started_at = time.perf_counter()
+        try:
+            proposal = await discussion_manager.create_proposal_draft(
+                interaction.guild_id
+            )
+        except MeetingManagerError as error:
+            execution_time = time.perf_counter() - started_at
+            logger.warning(
+                "/draft 失敗 guild_id=%s execution_seconds=%.3f：%s",
+                interaction.guild_id,
+                execution_time,
+                error,
+            )
+            await interaction.followup.send(
+                f"❌ 建立整合草案失敗：{error}\n"
+                f"處理耗時：{execution_time:.2f} 秒"
+            )
+            return
+
+        execution_time = time.perf_counter() - started_at
+        metrics_getter = getattr(
+            discussion_manager,
+            "get_proposal_metrics",
+            None,
+        )
+        metrics = (
+            metrics_getter(interaction.guild_id)
+            if callable(metrics_getter)
+            else None
+        )
+        await interaction.followup.send(
+            embed=format_proposal_embed(
+                proposal,
+                execution_time_seconds=execution_time,
+                metrics=metrics,
+                max_prompt_characters=settings.max_meeting_prompt_length,
+                max_response_characters=settings.max_meeting_response_length,
+            )
+        )
+        logger.info("PM 整合草案完成 guild_id=%s", interaction.guild_id)
+
+    @bot.tree.command(name="review", description="審查草案並產生最終方案")
+    async def review_command(interaction: discord.Interaction) -> None:
+        """執行 Review、一次指定修改與 PM 最終整合。"""
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ /review 只能在 Discord 伺服器中使用。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(thinking=True)
+        try:
+            result = await discussion_manager.review_and_finalize(
+                interaction.guild_id
+            )
+        except MeetingManagerError as error:
+            logger.warning("/review 失敗 guild_id=%s：%s", interaction.guild_id, error)
+            await interaction.followup.send(f"❌ Review 審查失敗：{error}")
+            return
+
+        await interaction.followup.send(embed=format_review_embed(result.review))
+        if result.revision_performed:
+            await interaction.followup.send(
+                "🔧 已將最高優先修改要求交給 "
+                f"**{result.revision_agent_name}**，本會議修改次數已達 1/1。"
+            )
+        else:
+            await interaction.followup.send("✅ 草案通過，未使用修改機會。")
+
+        metrics = discussion_manager.get_final_proposal_metrics(
+            interaction.guild_id
+        )
+        await interaction.followup.send(
+            embed=format_proposal_embed(
+                result.final_proposal,
+                metrics=metrics,
+                max_prompt_characters=settings.max_meeting_prompt_length,
+                max_response_characters=settings.max_meeting_response_length,
+            )
+        )
+        logger.info(
+            "Review 與最終整合完成 guild_id=%s revision_count=%s",
+            interaction.guild_id,
+            1 if result.revision_performed else 0,
         )
 
     @bot.event
@@ -315,11 +861,23 @@ def main() -> None:
         project_repository,
         guild_project_store,
     )
+    meeting_repository = JsonMeetingRepository(settings.meetings_file)
+    discussion_manager = MeetingManager(
+        meeting_repository,
+        PMAgent(llm_service),
+        ResearchAgent(llm_service),
+        CreativeAgent(llm_service),
+        FinanceAgent(llm_service),
+        ReviewAgent(llm_service),
+        max_prompt_characters=settings.max_meeting_prompt_length,
+        max_response_characters=settings.max_meeting_response_length,
+    )
     bot = create_bot(
         settings,
         llm_service,
         project_repository,
         meeting_service,
+        discussion_manager,
     )  # 將設定和服務注入 Discord Bot。
 
     # 日誌只顯示非敏感設定，絕對不輸出 settings.discord_token。

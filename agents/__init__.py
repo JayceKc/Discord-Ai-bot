@@ -9,7 +9,13 @@ from agents.base_agent import (
 )
 from agents.creative_agent import CreativeAgent, CreativeAnalysis, CreativeProposal
 from agents.finance_agent import FinanceAgent, FinanceAnalysis
-from agents.pm_agent import PMAgent, PMAnalysis
+from agents.pm_agent import (
+    PMAgent,
+    PMAnalysis,
+    PMDecision,
+    PMProposalDraft,
+    PMProposalSections,
+)
 from agents.research_agent import ResearchAgent, ResearchAnalysis
 from agents.review_agent import (
     ChecklistItem,
@@ -19,7 +25,7 @@ from agents.review_agent import (
     ReviewIssue,
     ReviewRequest,
 )
-from agents.structured_agent import StructuredAgent
+from agents.structured_agent import StructuredAgent, StructuredAgentResponse
 
 __all__ = [
     "AgentConfig",
@@ -34,6 +40,9 @@ __all__ = [
     "FinanceAnalysis",
     "PMAgent",
     "PMAnalysis",
+    "PMDecision",
+    "PMProposalDraft",
+    "PMProposalSections",
     "ResearchAgent",
     "ResearchAnalysis",
     "ChecklistItem",
@@ -43,4 +52,5 @@ __all__ = [
     "ReviewIssue",
     "ReviewRequest",
     "StructuredAgent",
+    "StructuredAgentResponse",
 ]

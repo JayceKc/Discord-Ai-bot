@@ -43,11 +43,16 @@ class CreativeAgent(StructuredAgent[CreativeAnalysis]):
                 "輸入會包含專案需求與 Research Agent 的研究結果。"
                 "請根據已知資訊及合理推論提出具體創意方案，每個方案都要說明"
                 "研究依據與執行步驟；待查證資訊不可當成已確定事實。"
+                "research_basis 至少引用 Research Agent 的一項內容，"
+                "說明方案延續了哪一項研究結果。"
+                "輸入包含 requirement_change 時，必須補充、反對或修正既有方案，"
+                "不得只表示同意。"
+                "每個分類最多列出 3 項，每項只寫一句精簡內容。"
             ),
             # Creative 使用較高溫度與不同 Seed，增加方案的變化性。
             temperature=0.8,
             seed=7,
-            max_output_tokens=700,
+            max_output_tokens=1000,
             json_schema=CreativeAnalysis.model_json_schema(),
         )
         super().__init__(config, llm_service, CreativeAnalysis)
