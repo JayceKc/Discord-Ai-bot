@@ -106,6 +106,15 @@ class ProjectMeetingServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.project_repository.update_status.assert_not_called()
 
+    async def test_prepare_project_reuses_same_in_progress_project(self) -> None:
+        self.guild_project_store.get_current_project_id.return_value = "PRJ-001"
+
+        result = await self.service.prepare_project(123456, "prj-001")
+
+        self.assertEqual(result.id, "PRJ-001")
+        self.project_repository.update_status.assert_not_called()
+        self.guild_project_store.set_current_project.assert_not_called()
+
     async def test_rejects_project_with_illegal_status_transition(self) -> None:
         self.project_repository.get_project.return_value = make_project(
             ProjectStatus.COMPLETED

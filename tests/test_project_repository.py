@@ -29,6 +29,10 @@ class JsonProjectRepositoryTest(unittest.TestCase):
         # 正式資料可能因 /start 或未來的 /end 改變，不假設一定是 pending。
         self.assertIsInstance(projects[0].status, ProjectStatus)
         self.assertEqual(projects[0].requirement_changes[0].project_id, "PRJ-001")
+        self.assertGreaterEqual(
+            sum(len(project.requirement_changes) for project in projects),
+            5,
+        )
 
     def test_updates_project_status_in_json(self) -> None:
         """狀態更新後，重新建立 Repository 仍可讀到新狀態。"""

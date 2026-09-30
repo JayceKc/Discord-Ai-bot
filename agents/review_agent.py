@@ -35,14 +35,18 @@ class ReviewRequest(BaseModel):
     project_id: NonEmptyText
     draft: NonEmptyText
     revision_count: RevisionCount = 0
+    user_choice: dict[str, object] | None = None
+    project_priority: str | None = None
+    priority_guidance: str | None = None
+    recent_experiences: list[dict[str, str]] = Field(default_factory=list)
 
 
 class ChecklistItem(BaseModel):
-    """檢查表中單一項目的通過狀態與判斷原因。"""
+    """檢查表中單一項目的 1～5 級評分與判斷原因。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    passed: bool
+    score: Annotated[int, Field(strict=True, ge=1, le=5)]
     reason: ReviewReason
 
 
@@ -99,7 +103,7 @@ class ReviewAnalysis(BaseModel):
             self.checklist.credibility,
             self.checklist.feasibility,
         )
-        all_passed = all(item.passed for item in checks)
+        all_passed = all(item.score >= 3 for item in checks)
 
         if self.status == "通過":
             if not all_passed:
@@ -125,11 +129,15 @@ class ReviewAgent(StructuredAgent[ReviewAnalysis]):
             system_prompt=(
                 "輸入是包含 project_id、draft 與 revision_count 的 JSON。"
                 "請分別檢查草案的完整度、創意、可信度與可行性，並為每項提供"
-                "通過狀態與具體原因。status 只能輸出「通過」或「需要修改」；"
+                "1 到 5 的整數 score 與具體原因；1 代表嚴重不足、3 代表達到基本標準、"
+                "5 代表表現優秀。status 只能輸出「通過」或「需要修改」；"
+                "四項都至少 3 分才能通過，有任何一項低於 3 分就需要修改。"
                 "若需要修改，必須列出問題、修改要求及高、中、低優先順序。"
                 "每個問題必須用 assigned_agent 指定 PM Agent、Research Agent、"
                 "Creative Agent 或 Finance Agent 其中一位負責修改。"
-                "專案最多只能修改一次。"
+                "專案最多只能修改一次。若有 user_choice，必須檢查方案是否具體落實選項及遵守硬性限制；不符合時列入問題。"
+                "若輸入包含 project_priority 與 recent_experiences，請在審查理由中"
+                "評估方案是否符合優先目標；歷史經驗僅供參考，不可當成本案事實。"
                 "字數限制在500字內"
             ),
             # 審查工作使用低溫度，讓判斷與輸出格式較穩定。

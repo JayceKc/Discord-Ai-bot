@@ -1,12 +1,18 @@
 import unittest
+from datetime import date
 
 from models.meeting import (
+    AgentSuggestion,
+    MeetingContext,
     MeetingDataError,
     MeetingRecord,
+    MeetingRoundSummary,
     MeetingStatus,
     MeetingStepRecord,
     MeetingStepStatus,
+    ProposalMetrics,
 )
+from models.project import RequirementChange
 
 
 class MeetingModelTest(unittest.TestCase):
@@ -39,11 +45,51 @@ class MeetingModelTest(unittest.TestCase):
                 MeetingStepRecord(
                     agent_name="PM Agent",
                     order=0,
+                    round_number=2,
                     status=MeetingStepStatus.COMPLETED,
                     input_text="建立 Discord Bot",
                     output_data={"goal": "完成 Bot"},
+                    input_characters=14,
+                    output_characters=18,
+                    prompt_tokens=120,
+                    completion_tokens=80,
+                    max_output_tokens=1000,
+                    execution_time_seconds=12.345,
                 )
             ],
+            meeting_context=MeetingContext(
+                agent_summaries={"PM Agent": "確認專案目標"},
+                suggestions=[
+                    AgentSuggestion(
+                        agent_name="PM Agent",
+                        category="work_items",
+                        content="建立 Discord 指令",
+                        round_number=2,
+                    )
+                ],
+                round_summaries=[
+                    MeetingRoundSummary(
+                        round_number=1,
+                        summary="PM 已完成需求拆解。",
+                    )
+                ],
+            ),
+            applied_requirement_change=RequirementChange(
+                id="CHG-001",
+                project_id="PRJ-001",
+                description="預算縮減 20%",
+                reason="客戶調整預算",
+                requested_at=date(2026, 9, 17),
+                status="待評估",
+            ),
+            proposal_metrics=ProposalMetrics(
+                input_characters=5800,
+                output_characters=3400,
+                prompt_tokens=1480,
+                completion_tokens=1210,
+                max_output_tokens=1600,
+                execution_time_seconds=72.35,
+            ),
             error="Research Agent 失敗",
         )
 

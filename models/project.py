@@ -112,6 +112,7 @@ class Project:
     acceptance_criteria: tuple[str, ...]  # 判定專案完成的驗收條件。
     status: ProjectStatus  # 待處理、進行中、已完成或已取消。
     requirement_changes: tuple[RequirementChange, ...] = ()  # 歷次需求變更。
+    owner_guild_id: int | None = None  # None 表示供所有 Guild 使用的種子專案。
 
     def can_transition_to(self, target: ProjectStatus) -> bool:
         """交由目前的 ProjectStatus 判斷狀態轉換是否合法。"""
@@ -148,7 +149,17 @@ class Project:
             acceptance_criteria=_required_string_tuple(data, "acceptance_criteria"),
             status=ProjectStatus.from_value(data.get("status")),
             requirement_changes=tuple(changes),
+            owner_guild_id=(
+                _require_nonnegative_int(data["owner_guild_id"], "owner_guild_id")
+                if data.get("owner_guild_id") is not None else None
+            ),
         )
+
+
+def _require_nonnegative_int(value: object, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ProjectDataError(f"{field} 必須是非負整數。")
+    return value
 
 
 def _required_str(data: Mapping[str, object], field: str) -> str:

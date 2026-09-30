@@ -5,11 +5,14 @@ import json
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
+from agents.errors import (
+    AgentError,
+    AgentInvalidJSONError,
+    AgentServiceError,
+    AgentTimeoutError,
+    RetryableAgentError,
+)
 from services.llm_service import LLMResponse, LLMServiceError, LLMUsage
-
-
-class AgentError(RuntimeError):
-    """Agent 無法產生或解析回覆時的統一錯誤。"""
 
 
 @dataclass(frozen=True)
@@ -93,9 +96,9 @@ class BaseAgent:
                 timeout=self.config.timeout_seconds,
             )
         except asyncio.TimeoutError as error:
-            raise AgentError("Agent 等待模型回覆逾時。") from error
+            raise AgentTimeoutError("Agent 等待模型回覆逾時。") from error
         except LLMServiceError as error:
-            raise AgentError(f"Agent 無法取得模型回覆：{error}") from error
+            raise AgentServiceError(f"Agent 無法取得模型回覆：{error}") from error
 
         data = None
         if self.config.json_schema is not None:
@@ -103,7 +106,7 @@ class BaseAgent:
             try:
                 data = json.loads(response.content)
             except json.JSONDecodeError as error:
-                raise AgentError("模型回覆不是合法 JSON。") from error
+                raise AgentInvalidJSONError("模型回覆不是合法 JSON。") from error
             if not isinstance(data, (dict, list)):
                 raise AgentError("模型 JSON 回覆必須是物件或陣列。")
 

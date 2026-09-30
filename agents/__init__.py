@@ -7,6 +7,12 @@ from agents.base_agent import (
     AgentResponse,
     BaseAgent,
 )
+from agents.errors import (
+    AgentInvalidJSONError,
+    AgentServiceError,
+    AgentTimeoutError,
+    RetryableAgentError,
+)
 from agents.creative_agent import CreativeAgent, CreativeAnalysis, CreativeProposal
 from agents.finance_agent import FinanceAgent, FinanceAnalysis
 from agents.pm_agent import (
@@ -16,6 +22,7 @@ from agents.pm_agent import (
     PMProposalDraft,
     PMProposalSections,
 )
+from agents.project_intent_agent import ProjectIntent, ProjectIntentAgent
 from agents.research_agent import ResearchAgent, ResearchAnalysis
 from agents.review_agent import (
     ChecklistItem,
@@ -33,6 +40,10 @@ __all__ = [
     "AgentLLMServiceProtocol",
     "AgentResponse",
     "BaseAgent",
+    "AgentTimeoutError",
+    "AgentServiceError",
+    "AgentInvalidJSONError",
+    "RetryableAgentError",
     "CreativeAgent",
     "CreativeAnalysis",
     "CreativeProposal",
@@ -43,6 +54,8 @@ __all__ = [
     "PMDecision",
     "PMProposalDraft",
     "PMProposalSections",
+    "ProjectIntent",
+    "ProjectIntentAgent",
     "ResearchAgent",
     "ResearchAnalysis",
     "ChecklistItem",

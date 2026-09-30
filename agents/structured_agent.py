@@ -13,11 +13,16 @@ from agents.base_agent import (
     AgentLLMServiceProtocol,
     BaseAgent,
 )
+from agents.errors import RetryableAgentError
 from services.llm_service import LLMUsage
 
 
 # 每個專業 Agent 都能指定自己的 Pydantic 輸出模型。
 OutputModel = TypeVar("OutputModel", bound=BaseModel)
+
+
+class AgentSchemaValidationError(RetryableAgentError):
+    """模型 JSON 可解析但不符合 Agent 的固定輸出 Schema。"""
 
 
 @dataclass(frozen=True)
@@ -61,7 +66,7 @@ class StructuredAgent(Generic[OutputModel]):
             # model_validate_json 同時解析 JSON 並檢查必要欄位與資料型別。
             output = self.output_model.model_validate_json(response.content)
         except ValidationError as error:
-            raise AgentError(
+            raise AgentSchemaValidationError(
                 f"{self.config.name} 回覆格式不正確，請重新產生。"
             ) from error
         return StructuredAgentResponse(

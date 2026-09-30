@@ -15,6 +15,9 @@ from .project_repository import (
     ProjectRepository,
     ProjectRepositoryError,
 )
+from .mysql_guild_project_store import MySQLGuildProjectStore
+from .mysql_meeting_repository import MySQLMeetingRepository
+from .mysql_project_repository import MySQLProjectRepository
 
 __all__ = [
     "GuildProjectStore",
@@ -26,4 +29,7 @@ __all__ = [
     "MeetingRepositoryError",
     "ProjectRepository",
     "ProjectRepositoryError",
+    "MySQLGuildProjectStore",
+    "MySQLMeetingRepository",
+    "MySQLProjectRepository",
 ]

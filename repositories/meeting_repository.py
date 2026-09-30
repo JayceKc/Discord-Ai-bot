@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import fcntl
 from pathlib import Path
 from typing import Protocol
 
@@ -25,6 +26,9 @@ class MeetingRepository(Protocol):
     def get_for_guild(self, guild_id: int) -> MeetingRecord | None:
         """取得 Guild 目前或最近一場會議。"""
 
+    def pending_decisions(self) -> list[MeetingRecord]:
+        """取得仍待使用者決策的最新會議，供啟動時恢復 View。"""
+
 
 class JsonMeetingRepository:
     """將 Guild 索引與完整會議紀錄持久保存為 JSON。"""
@@ -35,10 +39,27 @@ class JsonMeetingRepository:
     def save(self, record: MeetingRecord) -> None:
         """保存會議，並讓 Guild 指向這一場最新會議。"""
 
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.file_path.with_suffix(self.file_path.suffix + ".lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            document = self._read_document()
+            existing = document["meetings"].get(record.meeting_id)
+            if existing is not None and existing.get("storage_version", 0) != record.storage_version:
+                raise MeetingRepositoryError("會議資料已更新，請重新讀取最新狀態。")
+            if record.final_proposal is not None and record.decision_status not in {"legacy", "approved"}:
+                raise MeetingRepositoryError("方案尚未批准。")
+            data = record.to_dict()
+            data["storage_version"] += 1
+            document["meetings"][record.meeting_id] = data
+            document["guilds"][str(record.guild_id)] = record.meeting_id
+            self._write_document(document)
+            record.storage_version += 1
+
+    def pending_decisions(self) -> list[MeetingRecord]:
         document = self._read_document()
-        document["meetings"][record.meeting_id] = record.to_dict()
-        document["guilds"][str(record.guild_id)] = record.meeting_id
-        self._write_document(document)
+        return [record for meeting_id in document["guilds"].values()
+            if (record := self._convert_record(document["meetings"].get(meeting_id))) is not None
+            and record.decision_status in {"awaiting_choice", "awaiting_approval", "applying_choice"}]
 
     def get(self, meeting_id: str) -> MeetingRecord | None:
         """找不到指定 ID 時回傳 None。"""

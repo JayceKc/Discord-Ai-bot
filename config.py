@@ -25,6 +25,17 @@ class Settings:
     max_meeting_message_length: int = 1900  # 每段會議訊息保留 Discord 安全空間。
     max_meeting_prompt_length: int = 6000  # 單次傳給 Agent 的共享內容字元預算。
     max_meeting_response_length: int = 4000  # 單一 Agent 結構化回覆字元預算。
+    meeting_agent_max_attempts: int = 2  # 單一步驟含首次呼叫在內的最大嘗試次數。
+    meeting_retry_delay_seconds: float = 1.0  # 可重試錯誤之間的等待秒數。
+    db_host: str = "127.0.0.1"  # MySQL 主機位置。
+    db_port: int = 3307  # Docker 開發環境的 MySQL TCP 連接埠。
+    db_name: str = "ai_company"  # Bot 專用 database 名稱。
+    db_user: str = "ai_company_app"  # 僅有 CRUD 權限的應用程式帳號。
+    db_password: str = ""  # 只從 .env 讀取，不得寫入日誌。
+    db_pool_min_size: int = 1  # 常駐連線數。
+    db_pool_max_size: int = 5  # 同時可用連線上限。
+    db_connect_timeout_seconds: float = 10.0  # 建立連線的最長等待時間。
+    project_intake_channel_id: int = 0  # 0 代表自然語言入口尚未啟用。
     log_level: str = "INFO"  # 預設只顯示 INFO 以上等級的日誌。
 
 
@@ -62,6 +73,23 @@ def load_settings() -> Settings:
             "MAX_MEETING_RESPONSE_LENGTH",
             4000,
         ),
+        meeting_agent_max_attempts=_read_positive_int(
+            "MEETING_AGENT_MAX_ATTEMPTS", 2
+        ),
+        meeting_retry_delay_seconds=_read_nonnegative_float(
+            "MEETING_RETRY_DELAY_SECONDS", 1.0
+        ),
+        db_host=os.getenv("DB_HOST", "127.0.0.1").strip(),
+        db_port=_read_port("DB_PORT", 3307),
+        db_name=os.getenv("DB_NAME", "ai_company").strip(),
+        db_user=os.getenv("DB_USER", "ai_company_app").strip(),
+        db_password=os.getenv("DB_PASSWORD", ""),
+        db_pool_min_size=_read_positive_int("DB_POOL_MIN_SIZE", 1),
+        db_pool_max_size=_read_positive_int("DB_POOL_MAX_SIZE", 5),
+        db_connect_timeout_seconds=_read_positive_float(
+            "DB_CONNECT_TIMEOUT_SECONDS", 10.0
+        ),
+        project_intake_channel_id=_read_nonnegative_int("PROJECT_INTAKE_CHANNEL_ID", 0),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # 統一轉成大寫，例如 info 變成 INFO。
     )
 
@@ -91,6 +119,26 @@ def _read_positive_int(name: str, default: int) -> int:
     return value  # 驗證成功後回傳轉換完成的整數。
 
 
+def _read_nonnegative_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} 必須是整數。") from error
+    if value < 0:
+        raise RuntimeError(f"{name} 不能小於 0。")
+    return value
+
+
+def _read_port(name: str, default: int) -> int:
+    """讀取合法 TCP port。"""
+
+    value = _read_positive_int(name, default)
+    if value > 65535:
+        raise RuntimeError(f"{name} 必須介於 1 到 65535。")
+    return value
+
+
 def _read_positive_float(name: str, default: float) -> float:
     """讀取正浮點數環境變數，用於 Ollama 請求逾時秒數。"""
 
@@ -103,3 +151,16 @@ def _read_positive_float(name: str, default: float) -> float:
     if value <= 0:  # 逾時秒數必須是正數。
         raise RuntimeError(f"{name} 必須大於 0。")
     return value  # 驗證成功後回傳浮點數。
+
+
+def _read_nonnegative_float(name: str, default: float) -> float:
+    """讀取可為 0 的浮點數環境變數，用於測試時停用重試等待。"""
+
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise RuntimeError(f"{name} 必須是數字。") from error
+    if value < 0:
+        raise RuntimeError(f"{name} 不可小於 0。")
+    return value

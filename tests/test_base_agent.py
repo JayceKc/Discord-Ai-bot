@@ -1,6 +1,7 @@
 import unittest
 
 from agents.base_agent import AgentConfig, BaseAgent
+from agents.errors import AgentInvalidJSONError
 from services.llm_service import LLMResponse, LLMUsage
 
 
@@ -67,6 +68,16 @@ class BaseAgentTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.data, {"summary": "建立 Bot"})
         self.assertEqual(fake_llm.calls[0]["json_schema"], schema)
+
+    async def test_invalid_json_uses_retryable_error_type(self):
+        schema = {"type": "object"}
+        agent = BaseAgent(
+            AgentConfig("小企", "專案經理", "整理需求。", json_schema=schema),
+            FakeLLMService(make_response("不是 JSON")),
+        )
+
+        with self.assertRaises(AgentInvalidJSONError):
+            await agent.respond("建立 Discord Bot")
 
 
 if __name__ == "__main__":

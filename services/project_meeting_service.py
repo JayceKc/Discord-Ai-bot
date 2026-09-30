@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 from models.project import Project, ProjectStatus
 from repositories.guild_project_store import (
@@ -39,12 +40,23 @@ class ProjectMeetingService:
         if not normalized_id:
             raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。")
 
+        atomic_claim = getattr(self.project_repository, "claim_for_guild", None)
+        if callable(atomic_claim):
+            try:
+                return await atomic_claim(
+                    guild_id,
+                    normalized_id,
+                    allow_existing=False,
+                )
+            except ProjectRepositoryError as error:
+                raise ProjectMeetingError(str(error)) from error
+
         async with self._start_lock:
             try:
-                current_project_id = self.guild_project_store.get_current_project_id(
-                    guild_id
+                current_project_id = await _resolve(
+                    self.guild_project_store.get_current_project_id(guild_id)
                 )
-                project = self.project_repository.get_project(normalized_id)
+                project = await _resolve(self.project_repository.get_project(normalized_id))
             except (GuildProjectStoreError, ProjectRepositoryError) as error:
                 raise ProjectMeetingError("無法讀取專案狀態，請稍後再試。") from error
 
@@ -66,17 +78,68 @@ class ProjectMeetingService:
                 )
 
             try:
-                updated_project = self.project_repository.update_status(
-                    normalized_id,
-                    ProjectStatus.IN_PROGRESS,
+                updated_project = await _resolve(
+                    self.project_repository.update_status(
+                        normalized_id,
+                        ProjectStatus.IN_PROGRESS,
+                    )
                 )
-                self.guild_project_store.set_current_project(guild_id, normalized_id)
+                await _resolve(
+                    self.guild_project_store.set_current_project(guild_id, normalized_id)
+                )
             except (GuildProjectStoreError, ProjectRepositoryError) as error:
                 # Guild 狀態保存失敗時，盡力將專案復原為啟動前的狀態。
                 try:
-                    self.project_repository.update_status(normalized_id, project.status)
+                    await _resolve(
+                        self.project_repository.update_status(normalized_id, project.status)
+                    )
                 except ProjectRepositoryError:
                     pass
                 raise ProjectMeetingError("無法保存專案狀態，請稍後再試。") from error
 
             return updated_project
+
+    async def prepare_project(self, guild_id: int, project_id: str) -> Project:
+        """啟動新專案，或在同一專案已進行中時安全接續流程。"""
+
+        normalized_id = project_id.strip().upper()
+        if not normalized_id:
+            raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。")
+
+        atomic_claim = getattr(self.project_repository, "claim_for_guild", None)
+        if callable(atomic_claim):
+            try:
+                return await atomic_claim(
+                    guild_id,
+                    normalized_id,
+                    allow_existing=True,
+                )
+            except ProjectRepositoryError as error:
+                raise ProjectMeetingError(str(error)) from error
+
+        async with self._start_lock:
+            try:
+                current_project_id = await _resolve(
+                    self.guild_project_store.get_current_project_id(guild_id)
+                )
+                project = await _resolve(self.project_repository.get_project(normalized_id))
+            except (GuildProjectStoreError, ProjectRepositoryError) as error:
+                raise ProjectMeetingError("無法讀取專案狀態，請稍後再試。") from error
+
+            if current_project_id == normalized_id:
+                if project is None:
+                    raise ProjectMeetingError(f"找不到專案 ID：{normalized_id}。")
+                return project
+            if current_project_id is not None:
+                raise ProjectMeetingError(
+                    f"這個伺服器已有進行中會議：{current_project_id}。"
+                )
+
+        # 不在同一把 Lock 內再次取得 Lock，沿用既有啟動與補償邏輯。
+        return await self.start_project(guild_id, normalized_id)
+
+
+async def _resolve(value: object) -> object:
+    """相容尚未升級的 JSON Repository 與非同步 MySQL Repository。"""
+
+    return await value if inspect.isawaitable(value) else value

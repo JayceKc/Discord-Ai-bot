@@ -133,12 +133,16 @@ class MeetingContext:
     agent_summaries: dict[str, str] = field(default_factory=dict)
     suggestions: list[AgentSuggestion] = field(default_factory=list)
     round_summaries: list[MeetingRoundSummary] = field(default_factory=list)
+    priority_snapshot: str | None = None
+    experience_snapshot: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "agent_summaries": dict(self.agent_summaries),
             "suggestions": [item.to_dict() for item in self.suggestions],
             "round_summaries": [item.to_dict() for item in self.round_summaries],
+            "priority_snapshot": self.priority_snapshot,
+            "experience_snapshot": [dict(item) for item in self.experience_snapshot],
         }
 
     @classmethod
@@ -146,6 +150,8 @@ class MeetingContext:
         raw_summaries = data.get("agent_summaries", {})
         raw_suggestions = data.get("suggestions", [])
         raw_round_summaries = data.get("round_summaries", [])
+        raw_priority = data.get("priority_snapshot")
+        raw_experiences = data.get("experience_snapshot", [])
         if not isinstance(raw_summaries, dict) or any(
             not isinstance(key, str) or not isinstance(value, str)
             for key, value in raw_summaries.items()
@@ -159,6 +165,15 @@ class MeetingContext:
             not isinstance(item, Mapping) for item in raw_round_summaries
         ):
             raise MeetingDataError("round_summaries 必須是物件陣列。")
+        if raw_priority is not None and not isinstance(raw_priority, str):
+            raise MeetingDataError("priority_snapshot 必須是字串或 null。")
+        if not isinstance(raw_experiences, list) or any(
+            not isinstance(item, Mapping) or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in item.items()
+            ) for item in raw_experiences
+        ):
+            raise MeetingDataError("experience_snapshot 必須是文字物件陣列。")
         return cls(
             agent_summaries=dict(raw_summaries),
             suggestions=[AgentSuggestion.from_dict(item) for item in raw_suggestions],
@@ -166,6 +181,8 @@ class MeetingContext:
                 MeetingRoundSummary.from_dict(item)
                 for item in raw_round_summaries
             ],
+            priority_snapshot=raw_priority,
+            experience_snapshot=[dict(item) for item in raw_experiences],
         )
 
 
@@ -301,6 +318,15 @@ class MeetingRecord:
     final_proposal: dict[str, object] | None = None
     final_proposal_metrics: ProposalMetrics | None = None
     error: str | None = None
+    decision_owner_user_id: int | None = None
+    decision_status: str = "legacy"
+    decision_version: int = 0
+    storage_version: int = 0
+    user_decision: dict[str, object] | None = None
+    candidate_proposal: dict[str, object] | None = None
+    candidate_proposal_metrics: ProposalMetrics | None = None
+    candidate_review: dict[str, object] | None = None
+    decision_messages: list[dict[str, object]] = field(default_factory=list)
 
     @classmethod
     def new(
@@ -374,6 +400,15 @@ class MeetingRecord:
                 else None
             ),
             "error": self.error,
+            "decision_owner_user_id": self.decision_owner_user_id,
+            "decision_status": self.decision_status,
+            "decision_version": self.decision_version,
+            "storage_version": self.storage_version,
+            "user_decision": self.user_decision,
+            "candidate_proposal": self.candidate_proposal,
+            "candidate_proposal_metrics": self.candidate_proposal_metrics.to_dict() if self.candidate_proposal_metrics else None,
+            "candidate_review": self.candidate_review,
+            "decision_messages": self.decision_messages,
         }
 
     @classmethod
@@ -414,7 +449,30 @@ class MeetingRecord:
         if raw_final_metrics is not None and not isinstance(raw_final_metrics, Mapping):
             raise MeetingDataError("final_proposal_metrics 必須是物件或 null。")
 
+        decision_status = data.get("decision_status", "legacy")
+        if decision_status not in {"legacy", "preparing", "awaiting_choice", "applying_choice", "awaiting_approval", "approved"}:
+            raise MeetingDataError("決策狀態不合法。")
+        owner = data.get("decision_owner_user_id")
+        if owner is not None:
+            owner = _require_nonnegative_int(owner, "decision_owner_user_id")
+        if decision_status != "legacy" and owner is None:
+            raise MeetingDataError("新決策流程必須保存決策者。")
+        for name in ("user_decision", "candidate_proposal", "candidate_review", "candidate_proposal_metrics"):
+            if data.get(name) is not None and not isinstance(data[name], dict):
+                raise MeetingDataError(f"{name} 必須是物件。")
+        messages = data.get("decision_messages", [])
+        if not isinstance(messages, list) or any(not isinstance(item, dict) for item in messages):
+            raise MeetingDataError("decision_messages 必須是物件陣列。")
         return cls(
+            decision_owner_user_id=owner,
+            decision_status=decision_status,
+            decision_version=_require_nonnegative_int(data.get("decision_version", 0), "decision_version"),
+            storage_version=_require_nonnegative_int(data.get("storage_version", 0), "storage_version"),
+            user_decision=data.get("user_decision"),
+            candidate_proposal=data.get("candidate_proposal"),
+            candidate_proposal_metrics=ProposalMetrics.from_dict(data["candidate_proposal_metrics"]) if data.get("candidate_proposal_metrics") else None,
+            candidate_review=data.get("candidate_review"),
+            decision_messages=messages,
             meeting_id=_required_str(data, "meeting_id"),
             guild_id=_required_int(data, "guild_id"),
             project_id=_required_str(data, "project_id"),

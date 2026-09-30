@@ -56,6 +56,7 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
                     {"role": "user", "content": "整理需求"},
                 ],
                 "stream": False,
+                "think": False,
                 "options": {
                     "temperature": 0.2,
                     "seed": 42,
@@ -93,6 +94,7 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
                     "model": "qwen3.5:4b",
                     "messages": [{"role": "user", "content": "請介紹 Python"}],
                     "stream": False,
+                    "think": False,
                 }
             ],
         )
@@ -124,6 +126,16 @@ class LLMServiceTest(unittest.IsolatedAsyncioTestCase):
             error=httpx.ConnectError("connection refused", request=request)
         )
         service = LLMService(client=fake_client)
+
+        with self.assertRaisesRegex(LLMServiceError, "無法連線到 Ollama"):
+            await service.chat("問題")
+
+    async def test_chat_converts_ollama_builtin_connection_error(self):
+        """新版 Ollama Client 的內建 ConnectionError 也要轉成服務錯誤。"""
+
+        service = LLMService(
+            client=FakeOllamaClient(error=ConnectionError("Ollama is not running"))
+        )
 
         with self.assertRaisesRegex(LLMServiceError, "無法連線到 Ollama"):
             await service.chat("問題")

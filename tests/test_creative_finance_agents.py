@@ -1,6 +1,8 @@
 import json  # 建立兩個 Agent 共用的專案脈絡與假的 JSON 回覆。
 import unittest  # 執行非同步 Agent 單元測試。
 
+from pydantic import ValidationError
+
 from agents.creative_agent import CreativeAgent, CreativeAnalysis
 from agents.finance_agent import FinanceAgent, FinanceAnalysis
 from services.llm_service import LLMResponse, LLMUsage
@@ -25,7 +27,7 @@ class FakeCreativeFinanceLLMService:
         self.calls.append({"message": message, **kwargs})
         system_prompt = str(kwargs.get("system_prompt", ""))
 
-        if "Creative Agent" in system_prompt:
+        if "Agent 名稱：Creative Agent" in system_prompt:
             return make_response(
                 {
                     "proposals": [
@@ -53,6 +55,45 @@ class FakeCreativeFinanceLLMService:
 
 
 class CreativeFinanceAgentTest(unittest.IsolatedAsyncioTestCase):
+    def test_prompts_require_references_to_previous_agents(self) -> None:
+        """Creative 與 Finance 的 Prompt 必須要求回應前一位 Agent。"""
+
+        fake_llm = FakeCreativeFinanceLLMService()
+        creative_agent = CreativeAgent(fake_llm)
+        finance_agent = FinanceAgent(fake_llm)
+
+        self.assertIn("引用 Research Agent", creative_agent.config.system_prompt)
+        self.assertIn("Creative Agent", finance_agent.config.system_prompt)
+        self.assertIn("採用、延續或反對", finance_agent.config.system_prompt)
+        self.assertIn("最多列出 2 項", finance_agent.config.system_prompt)
+
+    def test_finance_schema_limits_item_count_and_text_length(self) -> None:
+        """Finance 即使不遵守 Prompt，也會被 Pydantic 的硬限制擋下。"""
+
+        valid_fields = {
+            "cost_considerations": ["先完成核心功能"],
+            "constraints": ["預算有限"],
+            "risks": ["時程可能延後"],
+            "alternatives": ["先製作 MVP"],
+        }
+        FinanceAnalysis.model_validate(valid_fields)
+
+        with self.assertRaises(ValidationError):
+            FinanceAnalysis.model_validate(
+                {
+                    **valid_fields,
+                    "risks": ["風險一", "風險二", "風險三"],
+                }
+            )
+
+        with self.assertRaises(ValidationError):
+            FinanceAnalysis.model_validate(
+                {
+                    **valid_fields,
+                    "alternatives": ["這是一段超過八十個字的替代方案" * 6],
+                }
+            )
+
     async def test_agents_produce_different_views_for_same_project(self) -> None:
         # 同一份脈絡包含原始需求與 Research Agent 的分類結果。
         project_context = json.dumps(
@@ -92,10 +133,10 @@ class CreativeFinanceAgentTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(creative_call["temperature"], 0.8)
         self.assertEqual(creative_call["seed"], 7)
-        self.assertEqual(creative_call["max_output_tokens"], 700)
+        self.assertEqual(creative_call["max_output_tokens"], 1000)
         self.assertEqual(finance_call["temperature"], 0.1)
         self.assertEqual(finance_call["seed"], 42)
-        self.assertEqual(finance_call["max_output_tokens"], 500)
+        self.assertEqual(finance_call["max_output_tokens"], 1000)
         self.assertNotEqual(
             creative_call["json_schema"],
             finance_call["json_schema"],

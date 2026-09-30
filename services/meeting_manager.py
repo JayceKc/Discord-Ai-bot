@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import logging
 import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol, TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel
+
+from agents.errors import RetryableAgentError
 
 from models.meeting import (
     AgentSuggestion,
@@ -22,6 +26,9 @@ from models.meeting import (
 )
 from models.project import RequirementChange
 from repositories.meeting_repository import MeetingRepository, MeetingRepositoryError
+from repositories.mysql_workspace_repository import MySQLWorkspaceRepository, WorkspaceRepositoryError
+from models.workspace import ProjectPriority
+from services.quality_evaluator import QualityEvaluationError, evaluate_review
 
 
 class MeetingManagerError(RuntimeError):
@@ -35,7 +42,21 @@ class ReviewWorkflowResult:
     review: dict[str, object]
     revision_performed: bool
     revision_agent_name: str | None
-    final_proposal: dict[str, object]
+    final_proposal: dict[str, object] | None
+    decision_status: str = "legacy"
+
+
+@dataclass(frozen=True)
+class FullMeetingResult:
+    """單一入口完成兩輪討論、審查與最終整合後的結果。"""
+
+    record: MeetingRecord
+    proposal_draft: dict[str, object]
+    review: dict[str, object]
+    revision_performed: bool
+    revision_agent_name: str | None
+    final_proposal: dict[str, object] | None
+    decision_status: str = "legacy"
 
 
 class MeetingAgent(Protocol):
@@ -57,6 +78,9 @@ MeetingStepCallback = Callable[
     [int, int, MeetingStepRecord],
     Awaitable[None],
 ]
+
+ResultT = TypeVar("ResultT")
+logger = logging.getLogger(__name__)
 
 
 # 每位後發言 Agent 只取得工作所需的前文欄位，避免 Prompt 持續膨脹。
@@ -135,8 +159,16 @@ class MeetingManager:
         meeting_id_factory: Callable[[], str] | None = None,
         max_prompt_characters: int = 6000,
         max_response_characters: int = 4000,
+        agent_max_attempts: int = 2,
+        retry_delay_seconds: float = 1.0,
+        workspace_repository: MySQLWorkspaceRepository | None = None,
     ) -> None:
-        if max_prompt_characters <= 0 or max_response_characters <= 0:
+        if (
+            max_prompt_characters <= 0
+            or max_response_characters <= 0
+            or agent_max_attempts <= 0
+            or retry_delay_seconds < 0
+        ):
             raise ValueError("會議 Prompt 與回覆字元預算必須大於 0。")
         self.repository = repository
         self._pm_agent = pm_agent
@@ -158,8 +190,14 @@ class MeetingManager:
         self._meeting_id_factory = meeting_id_factory or (lambda: str(uuid4()))
         self.max_prompt_characters = max_prompt_characters
         self.max_response_characters = max_response_characters
+        self.agent_max_attempts = agent_max_attempts
+        self.retry_delay_seconds = retry_delay_seconds
+        self.workspace_repository = workspace_repository
         self._guild_locks: dict[int, asyncio.Lock] = {}
         self._running_tasks: dict[int, asyncio.Task[object]] = {}
+        self._full_workflow_guilds: set[int] = set()
+        from services.user_decision_service import UserDecisionService
+        self.decision_service = UserDecisionService(self)
 
     async def start(
         self,
@@ -183,6 +221,7 @@ class MeetingManager:
         requirement: str,
         *,
         on_step: MeetingStepCallback | None = None,
+        decision_owner_user_id: int | None = None,
     ) -> MeetingRecord:
         """只執行 PM、Research、Creative 與 Finance，逐步回報結果。"""
 
@@ -192,7 +231,71 @@ class MeetingManager:
             requirement,
             first_round_only=True,
             on_step=on_step,
+            decision_owner_user_id=decision_owner_user_id,
         )
+
+    async def run_full_meeting(
+        self,
+        guild_id: int,
+        project_id: str,
+        requirement: str,
+        requirement_change: RequirementChange,
+        *,
+        on_step: MeetingStepCallback | None = None,
+        decision_owner_user_id: int | None = None,
+    ) -> FullMeetingResult:
+        """從可用檢查點完成第一輪、第二輪、草案、審查與最終方案。"""
+
+        if guild_id in self._full_workflow_guilds:
+            raise MeetingManagerError("這個伺服器已有完整會議流程正在執行。")
+        self._full_workflow_guilds.add(guild_id)
+        normalized_project_id = project_id.strip().upper()
+        try:
+            record = await self._get_for_guild(guild_id)
+            if (record is None or (
+                record.project_id != normalized_project_id
+                and record.final_proposal is not None
+            )):
+                record = await self.start_first_round(
+                    guild_id,
+                    normalized_project_id,
+                    requirement,
+                    on_step=on_step,
+                    **({"decision_owner_user_id": decision_owner_user_id} if decision_owner_user_id is not None else {}),
+                )
+            else:
+                if record.project_id != normalized_project_id:
+                    raise MeetingManagerError("目前會議不屬於指定專案。")
+                if record.status == MeetingStatus.FAILED:
+                    record = await self.resume(guild_id)
+                elif record.status != MeetingStatus.COMPLETED:
+                    raise MeetingManagerError("目前會議無法接續，請先取消或恢復。")
+
+            if record.applied_requirement_change is None:
+                record = await self.start_second_round(
+                    guild_id,
+                    requirement_change,
+                    on_step=on_step,
+                )
+            elif record.applied_requirement_change.id != requirement_change.id:
+                raise MeetingManagerError("目前會議已套用不同的需求變更。")
+
+            proposal_draft = await self.create_proposal_draft(guild_id)
+            workflow_result = await self.review_and_finalize(guild_id)
+            latest_record = await self._get_for_guild(guild_id)
+            if latest_record is None:
+                raise MeetingManagerError("找不到已完成的會議紀錄。")
+            return FullMeetingResult(
+                record=latest_record,
+                proposal_draft=proposal_draft,
+                review=workflow_result.review,
+                revision_performed=workflow_result.revision_performed,
+                revision_agent_name=workflow_result.revision_agent_name,
+                final_proposal=workflow_result.final_proposal,
+                decision_status=workflow_result.decision_status,
+            )
+        finally:
+            self._full_workflow_guilds.discard(guild_id)
 
     async def start_second_round(
         self,
@@ -208,7 +311,7 @@ class MeetingManager:
             raise MeetingManagerError("這個伺服器已有會議正在執行。")
 
         async with lock:
-            record = self._get_for_guild(guild_id)
+            record = await self._get_for_guild(guild_id)
             if record is None:
                 raise MeetingManagerError("這個伺服器沒有可進行第二輪的會議。")
             if record.status != MeetingStatus.COMPLETED:
@@ -217,9 +320,17 @@ class MeetingManager:
                 raise MeetingManagerError("需求變更不屬於目前進行中的專案。")
             if record.applied_requirement_change is not None:
                 raise MeetingManagerError("這場會議已經加入過一次需求變更。")
+            if record.final_proposal is not None:
+                raise MeetingManagerError("這場會議已有最終方案，不能再加入需求變更。")
+            if record.decision_status not in {"legacy", "preparing"}:
+                raise MeetingManagerError("已進入使用者決策階段，不能再加入第二輪需求變更。")
             if any(step.round_number == 2 for step in record.steps):
                 raise MeetingManagerError("這場會議已經建立第二輪回應。")
 
+            # 第一輪草案已展示給使用者；加入變更後需重新整合兩輪結果。
+            record.proposal_draft = None
+            record.proposal_metrics = None
+            record.review_result = None
             record.applied_requirement_change = requirement_change
             start_index = len(record.steps)
             for offset, agent_name in enumerate(self._agents_by_name.keys()):
@@ -235,7 +346,7 @@ class MeetingManager:
             # 現有架構以 COMPLETED 表示單輪完成；DAY 18 先直接重啟同一筆
             # 會議，後續再將「整場狀態」與「目前階段」正式拆開。
             record.status = MeetingStatus.RUNNING
-            self._save(record)
+            await self._save(record)
             return await self._run(
                 record,
                 already_running=True,
@@ -243,15 +354,17 @@ class MeetingManager:
                 on_step=on_step,
             )
 
-    async def create_proposal_draft(self, guild_id: int) -> dict[str, object]:
-        """讓 PM 整合兩輪內容，保存並回傳固定格式草案。"""
+    async def create_proposal_draft(
+        self, guild_id: int, *, allow_first_round_only: bool = True,
+    ) -> dict[str, object]:
+        """讓 PM 整合已完成的討論；自然語言入口可先展示第一輪草案。"""
 
         lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
         if lock.locked():
             raise MeetingManagerError("這個伺服器已有會議正在執行。")
 
         async with lock:
-            record = self._get_for_guild(guild_id)
+            record = await self._get_for_guild(guild_id)
             if record is None:
                 raise MeetingManagerError("這個伺服器沒有可整合的會議。")
             if record.status != MeetingStatus.COMPLETED:
@@ -261,31 +374,25 @@ class MeetingManager:
                 for step in record.steps
                 if step.status == MeetingStepStatus.COMPLETED
             }
-            if not {1, 2}.issubset(completed_rounds):
-                raise MeetingManagerError("必須完成兩輪討論才能建立整合草案。")
+            required_rounds = {1} if allow_first_round_only else {1, 2}
+            if not required_rounds.issubset(completed_rounds):
+                raise MeetingManagerError("尚未完成草案所需的討論輪次。")
+            if record.applied_requirement_change is not None and 2 not in completed_rounds:
+                raise MeetingManagerError("第二輪尚未完成，不能沿用第一輪草案。")
             if record.proposal_draft is not None:
                 return record.proposal_draft
 
             prompt = self._build_proposal_input(record)
             started_at = time.perf_counter()
             try:
-                integrate_with_metadata = getattr(
-                    self._pm_agent,
-                    "integrate_with_metadata",
-                    None,
+                response, prompt_tokens, completion_tokens, max_output_tokens = (
+                    await self._retry_operation(
+                        lambda: self._call_pm_integration(prompt),
+                        meeting_id=record.meeting_id,
+                        agent_name="PM Agent",
+                        stage="proposal_draft",
+                    )
                 )
-                if callable(integrate_with_metadata):
-                    detailed_response = await integrate_with_metadata(prompt)
-                    response = detailed_response.output
-                    prompt_tokens = detailed_response.usage.prompt_tokens
-                    completion_tokens = detailed_response.usage.completion_tokens
-                    max_output_tokens = detailed_response.max_output_tokens
-                else:
-                    # 測試 Fake 或其他實作可以只提供原本的 integrate()。
-                    response = await self._pm_agent.integrate(prompt)
-                    prompt_tokens = None
-                    completion_tokens = None
-                    max_output_tokens = None
             except RuntimeError as error:
                 # AgentError 繼承 RuntimeError，內容已去除敏感資料，可提供給 Discord。
                 raise MeetingManagerError(str(error)) from error
@@ -309,13 +416,13 @@ class MeetingManager:
                 raise MeetingManagerError("PM 整合草案超過字元預算。")
             record.proposal_draft = proposal
             record.proposal_metrics = metrics
-            self._save(record)
+            await self._save(record)
             return proposal
 
-    def get_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
+    async def get_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
         """取得已保存的草案統計，讓 Discord 顯示實際模型用量。"""
 
-        record = self._get_for_guild(guild_id)
+        record = await self._get_for_guild(guild_id)
         return record.proposal_metrics if record is not None else None
 
     async def review_and_finalize(self, guild_id: int) -> ReviewWorkflowResult:
@@ -326,7 +433,7 @@ class MeetingManager:
             raise MeetingManagerError("這個伺服器已有會議正在執行。")
 
         async with lock:
-            record = self._get_for_guild(guild_id)
+            record = await self._get_for_guild(guild_id)
             if record is None:
                 raise MeetingManagerError("這個伺服器沒有可審查的會議。")
             if record.proposal_draft is None:
@@ -334,8 +441,26 @@ class MeetingManager:
             if record.revision_count not in {0, 1}:
                 raise MeetingManagerError("草案修改次數不合法。")
 
+            if record.decision_status != "legacy":
+                try:
+                    await self.decision_service.prepare(record)
+                except MeetingManagerError:
+                    raise
+                except Exception as error:
+                    raise MeetingManagerError("決策整理失敗，請重試 /review。") from error
+                return ReviewWorkflowResult(
+                    review=record.review_result,
+                    revision_performed=record.revision_count == 1,
+                    revision_agent_name=record.revision_agent_name,
+                    final_proposal=record.final_proposal,
+                    decision_status=record.decision_status,
+                )
+
             # 已完成的流程直接回傳保存結果，不會再次呼叫 Agent。
             if record.final_proposal is not None and record.review_result is not None:
+                self._attach_quality_evaluation(record)
+                # 讓升級前已完成但仍佔用 Guild 的會議在重試時釋放專案。
+                await self._save(record)
                 return ReviewWorkflowResult(
                     review=record.review_result,
                     revision_performed=record.revision_count == 1,
@@ -352,7 +477,8 @@ class MeetingManager:
                     review_prompt,
                 )
                 record.review_result = review_result
-                self._save(record)
+                self._attach_quality_evaluation(record, strict=True)
+                await self._save(record)
             else:
                 review_result = record.review_result
 
@@ -360,7 +486,7 @@ class MeetingManager:
             if status == "通過":
                 record.final_proposal = dict(record.proposal_draft)
                 record.final_proposal_metrics = record.proposal_metrics
-                self._save(record)
+                await self._save(record)
                 return ReviewWorkflowResult(
                     review=review_result,
                     revision_performed=False,
@@ -387,7 +513,7 @@ class MeetingManager:
                 record.revision_count = 1
                 record.revision_agent_name = assigned_agent
                 record.revision_output = revision_output
-                self._save(record)
+                await self._save(record)
 
             if record.revision_output is None or record.revision_agent_name is None:
                 raise MeetingManagerError("找不到可供 PM 整合的修改結果。")
@@ -396,9 +522,24 @@ class MeetingManager:
             final_proposal, final_metrics = await self._integrate_final_proposal(
                 final_prompt
             )
+            final_review = await self._execute_workflow_agent(
+                record,
+                "Review Agent",
+                self._build_review_input(record, proposal=final_proposal),
+            )
+            try:
+                final_evaluation = evaluate_review(
+                    final_review,
+                    record.meeting_context.priority_snapshot,
+                )
+            except QualityEvaluationError as error:
+                raise MeetingManagerError(f"最終方案評估失敗：{error}") from error
+            final_evaluation["evaluated_artifact"] = "final_proposal"
+            final_review["quality_evaluation"] = final_evaluation
+            review_result["post_revision_review"] = final_review
             record.final_proposal = final_proposal
             record.final_proposal_metrics = final_metrics
-            self._save(record)
+            await self._save(record)
             return ReviewWorkflowResult(
                 review=review_result,
                 revision_performed=True,
@@ -406,11 +547,109 @@ class MeetingManager:
                 final_proposal=final_proposal,
             )
 
-    def get_final_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
+    async def get_final_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
         """取得 Review 流程完成後的 PM 最終方案統計。"""
 
-        record = self._get_for_guild(guild_id)
+        record = await self._get_for_guild(guild_id)
         return record.final_proposal_metrics if record is not None else None
+
+    def _attach_quality_evaluation(
+        self,
+        record: MeetingRecord,
+        *,
+        strict: bool = False,
+    ) -> None:
+        """以 Python 固定公式補上評估；舊版 passed 格式仍可讀取。"""
+
+        if record.review_result is None or "quality_evaluation" in record.review_result:
+            return
+        try:
+            evaluation = evaluate_review(
+                record.review_result,
+                record.meeting_context.priority_snapshot,
+            )
+        except QualityEvaluationError as error:
+            if strict:
+                raise MeetingManagerError(f"方案評估失敗：{error}") from error
+            logger.info("舊版 Review 沒有 Day 24 評分，保留原紀錄 meeting_id=%s", record.meeting_id)
+            return
+        record.review_result["quality_evaluation"] = evaluation
+
+    async def _retry_operation(
+        self,
+        operation: Callable[[], Awaitable[ResultT]],
+        *,
+        meeting_id: str,
+        agent_name: str,
+        stage: str,
+    ) -> ResultT:
+        """只針對明確可恢復的模型錯誤執行有限次數重試。"""
+
+        for attempt in range(1, self.agent_max_attempts + 1):
+            try:
+                return await operation()
+            except RetryableAgentError as error:
+                if attempt == self.agent_max_attempts:
+                    raise
+                logger.warning(
+                    "模型回覆可重試失敗 meeting_id=%s stage=%s agent=%s "
+                    "attempt=%s/%s error_type=%s",
+                    meeting_id,
+                    stage,
+                    agent_name,
+                    attempt,
+                    self.agent_max_attempts,
+                    type(error).__name__,
+                )
+                if self.retry_delay_seconds:
+                    await asyncio.sleep(self.retry_delay_seconds)
+        raise AssertionError("可重試操作未正常結束。")
+
+    async def _call_agent(
+        self,
+        agent: MeetingAgent,
+        prompt: str,
+    ) -> tuple[BaseModel, int | None, int | None, int | None]:
+        """呼叫 Agent，並相容於具有或不具有 token 統計的實作。"""
+
+        respond_with_metadata = getattr(agent, "respond_with_metadata", None)
+        if callable(respond_with_metadata):
+            detailed_response = await respond_with_metadata(prompt)
+            return (
+                detailed_response.output,
+                detailed_response.usage.prompt_tokens,
+                detailed_response.usage.completion_tokens,
+                detailed_response.max_output_tokens,
+            )
+        response = await agent.respond(prompt)
+        config = getattr(agent, "config", None)
+        configured_limit = getattr(config, "max_output_tokens", None)
+        max_output_tokens = (
+            configured_limit
+            if isinstance(configured_limit, int)
+            and not isinstance(configured_limit, bool)
+            and configured_limit >= 0
+            else None
+        )
+        return response, None, None, max_output_tokens
+
+    async def _call_pm_integration(
+        self,
+        prompt: str,
+    ) -> tuple[BaseModel, int | None, int | None, int | None]:
+        """呼叫 PM 整合，並保留可用的 token 統計。"""
+
+        integrate_with_metadata = getattr(self._pm_agent, "integrate_with_metadata", None)
+        if callable(integrate_with_metadata):
+            detailed_response = await integrate_with_metadata(prompt)
+            return (
+                detailed_response.output,
+                detailed_response.usage.prompt_tokens,
+                detailed_response.usage.completion_tokens,
+                detailed_response.max_output_tokens,
+            )
+        response = await self._pm_agent.integrate(prompt)
+        return response, None, None, None
 
     async def _execute_workflow_agent(
         self,
@@ -420,6 +659,10 @@ class MeetingManager:
     ) -> dict[str, object]:
         """執行審查階段的一位 Agent，並將輸入、輸出及統計保存為步驟。"""
 
+        if record.decision_status != "legacy":
+            for previous in reversed(record.steps):
+                if previous.agent_name == agent_name and previous.input_text == prompt and previous.status == MeetingStepStatus.COMPLETED:
+                    return previous.output_data
         agent = self._agents_by_name.get(agent_name)
         if agent is None:
             raise MeetingManagerError(f"找不到 {agent_name} 的執行器。")
@@ -434,19 +677,21 @@ class MeetingManager:
         )
         record.steps.append(step)
         record.current_step_index = step.order
-        self._save(record)
+        await self._save(record)
 
         started_at = time.perf_counter()
         try:
-            respond_with_metadata = getattr(agent, "respond_with_metadata", None)
-            if callable(respond_with_metadata):
-                detailed_response = await respond_with_metadata(prompt)
-                response = detailed_response.output
-                step.prompt_tokens = detailed_response.usage.prompt_tokens
-                step.completion_tokens = detailed_response.usage.completion_tokens
-                step.max_output_tokens = detailed_response.max_output_tokens
-            else:
-                response = await agent.respond(prompt)
+            response, prompt_tokens, completion_tokens, max_output_tokens = (
+                await self._retry_operation(
+                    lambda: self._call_agent(agent, prompt),
+                    meeting_id=record.meeting_id,
+                    agent_name=agent_name,
+                    stage="review_workflow",
+                )
+            )
+            step.prompt_tokens = prompt_tokens
+            step.completion_tokens = completion_tokens
+            step.max_output_tokens = max_output_tokens
             output = response.model_dump(mode="json")
             output_text = json.dumps(output, ensure_ascii=False)
             step.output_characters = len(output_text)
@@ -457,7 +702,7 @@ class MeetingManager:
             step.status = MeetingStepStatus.FAILED
             step.error = f"{agent_name} 審查流程執行失敗。"
             record.error = step.error
-            self._save(record)
+            await self._save(record)
             if isinstance(error, MeetingManagerError):
                 raise
             raise MeetingManagerError(step.error) from error
@@ -466,23 +711,38 @@ class MeetingManager:
         step.output_data = output
         step.status = MeetingStepStatus.COMPLETED
         record.error = None
-        self._save(record)
+        await self._save(record)
         return output
 
-    def _build_review_input(self, record: MeetingRecord) -> str:
-        """把 PM 初稿轉成 ReviewRequest 固定格式。"""
+    def _build_review_input(
+        self,
+        record: MeetingRecord,
+        *,
+        proposal: dict[str, object] | None = None,
+    ) -> str:
+        """把 PM 草案或修改後方案轉成 ReviewRequest 固定格式。"""
 
         assert record.proposal_draft is not None
+        review_target = proposal if proposal is not None else record.proposal_draft
         return self._validate_prompt_budget(
             json.dumps(
                 {
                     "project_id": record.project_id,
-                    "draft": json.dumps(record.proposal_draft, ensure_ascii=False),
+                    "draft": json.dumps(review_target, ensure_ascii=False),
                     "revision_count": record.revision_count,
+                    **({"user_choice": self._selected_option(record)} if record.user_decision and record.user_decision.get("selection") else {}),
+                    **self._priority_context(record),
                 },
                 ensure_ascii=False,
             )
         )
+
+    @staticmethod
+    def _selected_option(record):
+        if not record.user_decision or not record.user_decision.get("selection"):
+            return None
+        return next(o for o in record.user_decision["question"]["options"]
+            if o["option_id"] == record.user_decision["selection"]["option_id"])
 
     @staticmethod
     def _select_revision_issue(
@@ -532,11 +792,15 @@ class MeetingManager:
             "task": "依 Review Agent 的要求提出一次具體修正，禁止只表示同意。",
             "assigned_agent": assigned_agent,
             "original_proposal": json.dumps(
-                record.proposal_draft,
+                record.candidate_proposal or record.proposal_draft,
                 ensure_ascii=False,
             )[:2800],
             "review_issues": assigned_issues,
             "revision_limit": "這是唯一一次修改機會",
+            "user_choice": self._selected_option(record),
+            "requirement": record.requirement,
+            "requirement_change": record.applied_requirement_change.to_dict() if record.applied_requirement_change else None,
+            **self._priority_context(record),
         }
         return self._validate_prompt_budget(json.dumps(context, ensure_ascii=False))
 
@@ -565,6 +829,7 @@ class MeetingManager:
                 "保留固定五章節與決策紀錄",
                 "不得要求第二次修改",
             ],
+            **self._priority_context(record),
         }
         return self._validate_prompt_budget(json.dumps(context, ensure_ascii=False))
 
@@ -576,22 +841,14 @@ class MeetingManager:
 
         started_at = time.perf_counter()
         try:
-            integrate_with_metadata = getattr(
-                self._pm_agent,
-                "integrate_with_metadata",
-                None,
+            response, prompt_tokens, completion_tokens, max_output_tokens = (
+                await self._retry_operation(
+                    lambda: self._call_pm_integration(prompt),
+                    meeting_id="final-proposal",
+                    agent_name="PM Agent",
+                    stage="final_proposal",
+                )
             )
-            if callable(integrate_with_metadata):
-                detailed_response = await integrate_with_metadata(prompt)
-                response = detailed_response.output
-                prompt_tokens = detailed_response.usage.prompt_tokens
-                completion_tokens = detailed_response.usage.completion_tokens
-                max_output_tokens = detailed_response.max_output_tokens
-            else:
-                response = await self._pm_agent.integrate(prompt)
-                prompt_tokens = None
-                completion_tokens = None
-                max_output_tokens = None
         except Exception as error:
             if isinstance(error, RuntimeError):
                 raise MeetingManagerError(str(error)) from error
@@ -619,6 +876,7 @@ class MeetingManager:
         *,
         first_round_only: bool,
         on_step: MeetingStepCallback | None = None,
+        decision_owner_user_id: int | None = None,
     ) -> MeetingRecord:
         """套用共用 Guild Lock 與資料驗證後建立會議。"""
 
@@ -633,7 +891,7 @@ class MeetingManager:
             raise MeetingManagerError("這個伺服器已有會議正在執行。")
 
         async with lock:
-            current = self._get_for_guild(guild_id)
+            current = await self._get_for_guild(guild_id)
             if current is not None and current.status in {
                 MeetingStatus.PENDING,
                 MeetingStatus.RUNNING,
@@ -641,16 +899,35 @@ class MeetingManager:
             }:
                 raise MeetingManagerError("這個伺服器已有尚未結束的會議。")
 
+            if current is not None and current.decision_status not in {"legacy", "approved"}:
+                raise MeetingManagerError("目前會議尚待使用者決策或批准，不能啟動另一場。")
             record = MeetingRecord.new(
                 self._meeting_id_factory(),
                 guild_id,
                 normalized_project_id,
                 normalized_requirement,
             )
+            if decision_owner_user_id is not None:
+                if isinstance(decision_owner_user_id, bool) or not isinstance(decision_owner_user_id, int) or decision_owner_user_id <= 0:
+                    raise MeetingManagerError("決策者 ID 不合法。")
+                record.decision_owner_user_id = decision_owner_user_id
+                record.decision_status = "preparing"
+            if self.workspace_repository is not None:
+                try:
+                    workspace = await self.workspace_repository.get_or_create(
+                        guild_id, f"Guild {guild_id}"
+                    )
+                    experiences = await self.workspace_repository.recent_experiences(
+                        guild_id, normalized_project_id, exclude_meeting_id=record.meeting_id
+                    )
+                except WorkspaceRepositoryError as error:
+                    raise MeetingManagerError(str(error)) from error
+                record.meeting_context.priority_snapshot = workspace.default_priority.value
+                record.meeting_context.experience_snapshot = experiences
             if first_round_only:
                 # Review 屬於後續審查階段，不放進第一輪討論紀錄。
                 record.steps = record.steps[:4]
-            self._save(record)
+            await self._save(record)
             return await self._run(record, on_step=on_step)
 
     async def _run(
@@ -668,7 +945,7 @@ class MeetingManager:
         # 恢復舊會議時，用已完成步驟補齊可能缺少的共享內容。
         self._refresh_context_from_completed_steps(record)
         record.error = None
-        self._save(record)
+        await self._save(record)
         current_task = asyncio.current_task()
         if current_task is not None:
             self._running_tasks[record.guild_id] = current_task
@@ -689,41 +966,21 @@ class MeetingManager:
                 step.input_characters = len(step.input_text)
                 step.status = MeetingStepStatus.RUNNING
                 step.error = None
-                self._save(record)
+                await self._save(record)
 
                 started_at = time.perf_counter()
                 try:
-                    # 正式 StructuredAgent 可回傳 Token 統計；簡易 Fake Agent
-                    # 仍可只實作 respond()，方便既有測試與替換實作。
-                    respond_with_metadata = getattr(
-                        agent,
-                        "respond_with_metadata",
-                        None,
+                    response, prompt_tokens, completion_tokens, max_output_tokens = (
+                        await self._retry_operation(
+                            lambda: self._call_agent(agent, step.input_text or ""),
+                            meeting_id=record.meeting_id,
+                            agent_name=step.agent_name,
+                            stage=f"round_{step.round_number}",
+                        )
                     )
-                    if callable(respond_with_metadata):
-                        detailed_response = await respond_with_metadata(
-                            step.input_text
-                        )
-                        response = detailed_response.output
-                        step.prompt_tokens = detailed_response.usage.prompt_tokens
-                        step.completion_tokens = (
-                            detailed_response.usage.completion_tokens
-                        )
-                        step.max_output_tokens = detailed_response.max_output_tokens
-                    else:
-                        response = await agent.respond(step.input_text)
-                        config = getattr(agent, "config", None)
-                        configured_limit = getattr(
-                            config,
-                            "max_output_tokens",
-                            None,
-                        )
-                        if (
-                            isinstance(configured_limit, int)
-                            and not isinstance(configured_limit, bool)
-                            and configured_limit >= 0
-                        ):
-                            step.max_output_tokens = configured_limit
+                    step.prompt_tokens = prompt_tokens
+                    step.completion_tokens = completion_tokens
+                    step.max_output_tokens = max_output_tokens
                     output_data = response.model_dump(mode="json")
                     if step.round_number == 2:
                         self._validate_second_round_output(output_data)
@@ -744,13 +1001,13 @@ class MeetingManager:
                 self._record_step_context(record, step)
                 if step.agent_name == "Finance Agent":
                     self._save_round_summary(record, step.round_number)
-                self._save(record)
+                await self._save(record)
                 if on_step is not None:
                     await on_step(index - start_index + 1, total_steps, step)
 
             record.transition_to(MeetingStatus.COMPLETED)
             record.current_step_index = len(record.steps)
-            self._save(record)
+            await self._save(record)
             return record
         except asyncio.CancelledError:
             # CancelledError 必須繼續向上拋出，但先保存可恢復辨識的狀態。
@@ -762,7 +1019,7 @@ class MeetingManager:
                     MeetingStepStatus.RUNNING,
                 }:
                     step.status = MeetingStepStatus.CANCELLED
-                self._save(record)
+                await self._save(record)
             raise
         except Exception as error:
             step = record.steps[record.current_step_index]
@@ -778,17 +1035,17 @@ class MeetingManager:
             record.error = safe_error
             record.transition_to(MeetingStatus.FAILED)
             try:
-                self._save(record)
+                await self._save(record)
             except MeetingManagerError as save_error:
                 raise MeetingManagerError("無法保存會議失敗狀態。") from save_error
             raise MeetingManagerError(safe_error) from error
         finally:
             self._running_tasks.pop(record.guild_id, None)
 
-    def cancel(self, guild_id: int) -> MeetingRecord:
+    async def cancel(self, guild_id: int) -> MeetingRecord:
         """取消目前會議並中止正在等待 Agent 的 Task。"""
 
-        record = self._get_for_guild(guild_id)
+        record = await self._get_for_guild(guild_id)
         if record is None:
             raise MeetingManagerError("這個伺服器沒有可取消的會議。")
         if record.status not in {
@@ -806,7 +1063,7 @@ class MeetingManager:
                 MeetingStepStatus.RUNNING,
             }:
                 step.status = MeetingStepStatus.CANCELLED
-        self._save(record)
+        await self._save(record)
 
         running_task = self._running_tasks.get(guild_id)
         if running_task is not None:
@@ -821,7 +1078,7 @@ class MeetingManager:
             raise MeetingManagerError("這個伺服器已有會議正在執行。")
 
         async with lock:
-            record = self._get_for_guild(guild_id)
+            record = await self._get_for_guild(guild_id)
             if record is None or record.status != MeetingStatus.FAILED:
                 raise MeetingManagerError("這個伺服器沒有可恢復的失敗會議。")
 
@@ -841,14 +1098,19 @@ class MeetingManager:
             failed_step.output_data = None
             failed_step.error = None
             record.transition_to(MeetingStatus.RUNNING)
-            self._save(record)
+            await self._save(record)
             return await self._run(record, already_running=True)
 
     def _build_input(self, record: MeetingRecord, index: int) -> str:
         """依目前步驟組合需求與先前 Agent 的結構化結果。"""
 
         if index == 0:
-            return self._validate_prompt_budget(record.requirement)
+            if record.meeting_context.priority_snapshot is None:
+                return self._validate_prompt_budget(record.requirement)
+            return self._validate_prompt_budget(json.dumps({
+                "requirement": record.requirement,
+                **self._priority_context(record),
+            }, ensure_ascii=False))
 
         agent_name = record.steps[index].agent_name
         current_step = record.steps[index]
@@ -899,6 +1161,7 @@ class MeetingManager:
             "project_id": record.project_id,
             "requirement": record.requirement,
             "meeting_context": shared_context,
+            **self._priority_context(record),
         }
 
         if current_step.round_number == 2:
@@ -930,6 +1193,7 @@ class MeetingManager:
                     "project_id": record.project_id,
                     "draft": json.dumps(review_context, ensure_ascii=False),
                     "revision_count": 0,
+                    **self._priority_context(record),
                 },
                 ensure_ascii=False,
             ))
@@ -997,10 +1261,26 @@ class MeetingManager:
                 "驗收標準",
             ],
             "decision_types": ["採用", "拒絕", "折衷"],
+            **self._priority_context(record),
         }
         return self._validate_prompt_budget(
             json.dumps(context, ensure_ascii=False)
         )
+
+    @staticmethod
+    def _priority_context(record: MeetingRecord) -> dict[str, object]:
+        raw = record.meeting_context.priority_snapshot
+        if raw is None:
+            return {}
+        try:
+            priority = ProjectPriority(raw)
+        except ValueError as error:
+            raise MeetingManagerError("會議優先目標資料不正確。") from error
+        return {
+            "project_priority": priority.label,
+            "priority_guidance": priority.guidance,
+            "recent_experiences": record.meeting_context.experience_snapshot,
+        }
 
     def _validate_prompt_budget(self, prompt: str) -> str:
         """限制單次送給 Agent 的 Prompt 字元數。"""
@@ -1135,18 +1415,21 @@ class MeetingManager:
             MeetingRoundSummary(round_number=round_number, summary=summary)
         )
 
-    def _get_for_guild(self, guild_id: int) -> MeetingRecord | None:
+    async def _get_for_guild(self, guild_id: int) -> MeetingRecord | None:
         """將 Repository 讀取錯誤轉為服務層的安全訊息。"""
 
         try:
-            return self.repository.get_for_guild(guild_id)
+            result = self.repository.get_for_guild(guild_id)
+            return await result if inspect.isawaitable(result) else result
         except MeetingRepositoryError as error:
             raise MeetingManagerError("無法讀取會議狀態。") from error
 
-    def _save(self, record: MeetingRecord) -> None:
+    async def _save(self, record: MeetingRecord) -> None:
         """將 Repository 寫入錯誤轉為服務層的安全訊息。"""
 
         try:
-            self.repository.save(record)
+            result = self.repository.save(record)
+            if inspect.isawaitable(result):
+                await result
         except MeetingRepositoryError as error:
             raise MeetingManagerError("無法保存會議狀態。") from error
