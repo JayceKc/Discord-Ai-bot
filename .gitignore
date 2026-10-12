@@ -4,3 +4,27 @@ __pycache__/
 guild_projects.json
 .worktrees/
 meetings.json
+.runtime/
+.env.*
+!.env.example
+.DS_Store
+*.py[cod]
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+meetings2.json
+meetings-*.json
+guild_projects-*.json
+private-exports/
+private-backups/
+
+# 測試及開發紀錄只保留本機，不納入發佈版本。
+/tests/
+/implementation-plan/
+/implementation-report/
+/docs/
+/testing-teaching/
+/manual_test*.py
+/scripts/test_*.py
+/examples/

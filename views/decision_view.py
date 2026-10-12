@@ -4,9 +4,14 @@ from __future__ import annotations
 import logging
 import inspect
 import discord
+from core.error_handler import ErrorHandler
+from core.errors import ErrorContext
+from presentation.discord_delivery import (safe_defer, safe_followup_send, safe_message_edit, safe_channel_send, safe_original_response_edit, DELIVERY_ERRORS)
 
 from services.meeting_manager import MeetingManagerError
 from services.user_decision_service import UserDecisionService
+from presentation.embeds import build_decision_embeds, build_approval_embeds
+from presentation.progress import build_status_embeds
 
 logger = logging.getLogger(__name__)
 SECTION_LABELS = {
@@ -16,21 +21,8 @@ SECTION_LABELS = {
 
 
 def decision_embed(record):
-    question = record.user_decision["question"]
-    embed = discord.Embed(title="🗳️ 需要你決定：" + question["topic"][:180],
-        description=question["why_user_decision_needed"], color=discord.Color.blue())
-    source_lines = []
-    for source in question["sources"]:
-        step = record.steps[source["step_index"]]
-        source_lines.append(f"{step.agent_name} 第 {step.round_number} 輪：{source['quote']}")
-    embed.add_field(name="討論依據", value="\n".join(source_lines)[:1024], inline=False)
-    last = record.user_decision["history"][-1] if record.user_decision["history"] else None
-    for option in question["options"]:
-        rejected = last and last["outcome"] == "rejected" and last["selection"]["option_id"] == option["option_id"]
-        embed.add_field(name=f"{option['option_id']}｜{option['label']}" + ("（已駁回，請改選）" if rejected else ""),
-            value=f"{option['description']}\n好處：{option['benefits']}\n代價：{option['tradeoffs']}\n影響：" + "、".join(SECTION_LABELS[key] for key in option["expected_changes"]), inline=False)
-    embed.set_footer(text=f"只有會議啟動者可選擇。備用：/decide choice:A（或 B、C）｜版本 {record.decision_version}")
-    return embed
+    """Compatibility helper; full output is provided by build_decision_embeds."""
+    return build_decision_embeds(record)[0]
 
 
 class DecisionView(discord.ui.View):
@@ -55,42 +47,42 @@ class DecisionView(discord.ui.View):
         self.add_item(button)
 
     async def interaction_check(self, interaction):
+        if not await safe_defer(interaction, ephemeral=True):
+            return False
         try:
             record = await self.presenter.service.get(self.guild_id)
             self.presenter.service.authorize(record, interaction.guild_id, interaction.user.id,
                 meeting_id=self.meeting_id, version=self.version,
                 message_id=interaction.message.id if interaction.message else -1)
             return True
-        except MeetingManagerError as error:
-            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+        except Exception as error:
+            await ErrorHandler().handle(error, ErrorContext(guild_id=self.guild_id, write_outcome='not_started'), interaction=interaction)
             return False
 
     async def handle(self, interaction, choice):
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        try:
-            record = await self.presenter.service.act(interaction.guild_id, interaction.user.id, choice,
-                meeting_id=self.meeting_id, version=self.version, message_id=interaction.message.id)
-        except MeetingManagerError as error:
-            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        if not await safe_defer(interaction, ephemeral=True):
             return
+        await safe_original_response_edit(interaction, "⏳ 正在處理；可用 /status 查看公開進度。")
+        completed = False
+        try:
+            record = await self.presenter.act(interaction, choice,
+                meeting_id=self.meeting_id, version=self.version, message_id=interaction.message.id)
+            completed = True
+        except Exception as error:
+            await ErrorHandler().handle(error, ErrorContext(guild_id=self.guild_id, write_outcome='unknown'), interaction=interaction)
+            return
+        finally:
+            await safe_original_response_edit(interaction, "✅ 操作已保存；請查看會議頻道的結果，或使用 /status 查詢目前階段與下一步。" if completed else "❌ 操作未完成；請查看錯誤卡。若已保存選擇，請用 /decide 重試相同選項。")
         for child in self.children:
             child.disabled = True
         try:
-            await interaction.message.edit(view=self)
-        except discord.HTTPException:
+            await safe_message_edit(interaction.message, view=self)
+        except DELIVERY_ERRORS:
             logger.warning("無法停用舊決策按鈕 meeting_id=%s", self.meeting_id)
         await self.presenter.present(record, interaction.channel)
-        try:
-            await interaction.followup.send("✅ 操作已保存；若未看到結果，請使用 /review。", ephemeral=True)
-        except discord.HTTPException:
-            logger.warning("決策已保存但互動回覆失敗 meeting_id=%s", self.meeting_id)
 
     async def on_error(self, interaction, error, item):
-        logger.error("決策按鈕處理失敗 error_type=%s", type(error).__name__)
-        if interaction.response.is_done():
-            await interaction.followup.send("❌ 操作中斷，請使用 /review 查看狀態或 /decide 重試。", ephemeral=True)
-        else:
-            await interaction.response.send_message("❌ 操作中斷，請稍後重試。", ephemeral=True)
+        await ErrorHandler().handle(error, ErrorContext(guild_id=self.guild_id, write_outcome='unknown'), interaction=interaction)
 
 
 class ApprovalView(DecisionView):
@@ -106,54 +98,66 @@ class ApprovalView(DecisionView):
 
 
 class DecisionPresenter:
-    def __init__(self, bot, service: UserDecisionService, proposal_formatter, review_formatter):
+    def __init__(self, bot, service: UserDecisionService, proposal_formatter=None, review_formatter=None, *, router=None, run_workflow=None):
         self.bot = bot
+        self.router = router
+        self.run_workflow = run_workflow
         self.service = service
         self.proposal_formatter = proposal_formatter
         self.review_formatter = review_formatter
 
+    async def act(self, interaction, choice, **kwargs):
+        if self.run_workflow is not None:
+            return await self.run_workflow(self.service.act, interaction.guild_id,
+                interaction.user.id, choice, channel=interaction.channel, **kwargs)
+        return await self.service.act(interaction.guild_id, interaction.user.id, choice, **kwargs)
+
+    async def _send(self, record, channel, embed, view=None):
+        if self.router is not None:
+            return await self.router.send(record.guild_id, "meeting", channel, embed=embed, view=view)
+        return await safe_channel_send(channel, embed=embed, view=view, allowed_mentions=discord.AllowedMentions.none())
+
     async def present(self, record, channel):
         if channel is None:
             return False
+        message = None
+        view = None
         try:
             await self.disable_previous(record, channel)
-            if record.decision_status == "applying_choice":
-                await channel.send("選擇已保存。處理中斷時請用 `/decide` 選擇相同選項重試；Bot 中斷的處理保留最多 15 分鐘。")
-                return True
             if record.decision_status == "awaiting_choice":
+                pages = build_decision_embeds(record)
                 view = DecisionView(self, record)
-                message = await channel.send(embed=decision_embed(record), view=view)
             elif record.decision_status in {"awaiting_approval", "approved"}:
-                approved = record.decision_status == "approved"
-                proposal = record.final_proposal if approved else record.candidate_proposal
-                embed = self.proposal_formatter(proposal,
-                    metrics=record.final_proposal_metrics if approved else record.candidate_proposal_metrics)
-                embed.title = ("已批准｜" if approved else "待批准｜") + embed.title[:245]
-                for key, label in SECTION_LABELS.items():
-                    embed.add_field(name=label, value=proposal["sections"][key][:1024], inline=False)
-                await channel.send(embed=embed)
-                await channel.send(embed=self.review_formatter(record.candidate_review, stage="已批准方案" if approved else "待批准方案"))
-                before = record.review_result["quality_evaluation"]["outputs"]["quality_index"]
-                after = record.candidate_review["quality_evaluation"]["outputs"]["quality_index"]
-                embed = discord.Embed(title="✅ 方案已批准" if approved else "請確認決策後的方案",
-                    description=f"選擇：{record.user_decision['selection']['option_id']}\n品質指標：{before} → {after}（{after-before:+.1f}）",
-                    color=discord.Color.green() if approved else discord.Color.orange())
-                # Each impact fits one field; preserve every actual change.
-                for i in record.user_decision["impact"]:
-                    embed.add_field(name=SECTION_LABELS[i["section"]],
-                        value=f"修改前：{i['before']}\n修改後：{i['after']}\n理由：{i['reason']}"[:1024], inline=False)
-                if approved:
-                    await channel.send(embed=embed)
-                    return True
-                embed.set_footer(text=f"備用：/decide choice:approve 或 reject｜版本 {record.decision_version}")
-                view = ApprovalView(self, record)
-                message = await channel.send(embed=embed, view=view)
+                pages = build_approval_embeds(record)
+                view = ApprovalView(self, record) if record.decision_status == "awaiting_approval" else None
             else:
-                return False
-            await self.service.remember_message(record.guild_id, record.meeting_id, record.decision_version,
-                record.decision_status, channel.id, message.id)
+                pages = build_status_embeds(record)
+            for index, embed in enumerate(pages):
+                message = await self._send(record, channel, embed, view if index == len(pages)-1 else None)
+                if message is None:
+                    return False
+            if view is not None:
+                target_id = getattr(getattr(message, "channel", None), "id", channel.id)
+                try:
+                    await self.service.remember_message(record.guild_id, record.meeting_id, record.decision_version,
+                        record.decision_status, target_id, message.id)
+                except Exception:
+                    try:
+                        await safe_message_edit(message, view=None)
+                    except DELIVERY_ERRORS:
+                        pass
+                    raise
+            if self.router is not None:
+                # Reload after registering the operation message, so the status
+                # link points to the exact channel and message authorized above.
+                latest = await self.service.get(record.guild_id)
+                target = self.router.resolve(record.guild_id, "status", channel)
+                meeting_target = getattr(message, "channel", channel)
+                if target is not None and getattr(target, "id", None) != getattr(meeting_target, "id", None):
+                    for embed in build_status_embeds(latest):
+                        await self.router.send(record.guild_id, "status", channel, embed=embed)
             return True
-        except (discord.HTTPException, MeetingManagerError) as error:
+        except Exception as error:
             logger.warning("決策訊息未完成傳送 meeting_id=%s error_type=%s", record.meeting_id, type(error).__name__)
             return False
 
@@ -166,8 +170,8 @@ class DecisionPresenter:
             if target is None or not hasattr(target, "get_partial_message"):
                 continue
             try:
-                await target.get_partial_message(message["message_id"]).edit(view=None)
-            except discord.HTTPException:
+                await safe_message_edit(target.get_partial_message(message["message_id"]), view=None)
+            except DELIVERY_ERRORS:
                 logger.warning("舊按鈕訊息無法更新 message_id=%s", message["message_id"])
 
     async def restore(self):

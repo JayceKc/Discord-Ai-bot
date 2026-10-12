@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.errors import AppError
+
 import json
 import fcntl
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import Protocol
 from models.meeting import MeetingDataError, MeetingRecord
 
 
-class MeetingRepositoryError(RuntimeError):
+class MeetingRepositoryError(AppError):
     """讀取或保存會議紀錄時發生錯誤。"""
 
 

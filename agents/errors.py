@@ -1,7 +1,9 @@
 """Agent 錯誤型別，獨立模組可避免服務層與 Agent 基底類別循環匯入。"""
 
+from core.errors import AppError, ErrorCode, classify_error
 
-class AgentError(RuntimeError):
+
+class AgentError(AppError):
     """Agent 無法產生或解析回覆時的統一錯誤。"""
 
 
@@ -19,3 +21,9 @@ class AgentServiceError(RetryableAgentError):
 
 class AgentInvalidJSONError(RetryableAgentError):
     """模型輸出不是可解析的 JSON。"""
+
+AgentTimeoutError.default_code = ErrorCode.OLLAMA_TIMEOUT
+
+AgentServiceError.default_code = ErrorCode.OLLAMA_UNAVAILABLE
+
+AgentInvalidJSONError.default_code = ErrorCode.LLM_INVALID_OUTPUT

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from core.errors import AppError
+
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 
-class GuildProjectStoreError(RuntimeError):
+class GuildProjectStoreError(AppError):
     """讀取或保存 Guild 專案狀態時發生錯誤。"""
 
 

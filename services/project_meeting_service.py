@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from core.errors import AppError, ErrorCode, classify_error
+
 import asyncio
 import inspect
 
@@ -16,7 +18,7 @@ from repositories.project_repository import (
 )
 
 
-class ProjectMeetingError(RuntimeError):
+class ProjectMeetingError(AppError):
     """無法啟動專案會議時，提供給 Discord 使用者的安全訊息。"""
 
 
@@ -38,7 +40,7 @@ class ProjectMeetingService:
 
         normalized_id = project_id.strip().upper()
         if not normalized_id:
-            raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。")
+            raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。", code=ErrorCode.INVALID_ARGUMENT)
 
         atomic_claim = getattr(self.project_repository, "claim_for_guild", None)
         if callable(atomic_claim):
@@ -49,7 +51,7 @@ class ProjectMeetingService:
                     allow_existing=False,
                 )
             except ProjectRepositoryError as error:
-                raise ProjectMeetingError(str(error)) from error
+                raise ProjectMeetingError(code=classify_error(error).code) from error
 
         async with self._start_lock:
             try:
@@ -62,19 +64,23 @@ class ProjectMeetingService:
 
             if current_project_id == normalized_id:
                 raise ProjectMeetingError(
-                    f"專案 {normalized_id} 已經在這個伺服器進行中。"
+                    f"專案 {normalized_id} 已經在這個伺服器進行中。",
+                    code=ErrorCode.INVALID_STATE,
                 )
             if current_project_id is not None:
                 raise ProjectMeetingError(
-                    f"這個伺服器已有進行中會議：{current_project_id}。"
+                    f"這個伺服器已有進行中會議：{current_project_id}。",
+                    code=ErrorCode.INVALID_STATE,
                 )
             if project is None:
                 raise ProjectMeetingError(
-                    f"找不到專案 ID：{normalized_id}，請先使用 /projects 查看。"
+                    f"找不到專案 ID：{normalized_id}，請先使用 /projects 查看。",
+                    code=ErrorCode.PROJECT_NOT_FOUND,
                 )
             if not project.can_transition_to(ProjectStatus.IN_PROGRESS):
                 raise ProjectMeetingError(
-                    f"專案 {normalized_id} 目前是「{project.status.label}」，無法啟動。"
+                    f"專案 {normalized_id} 目前是「{project.status.label}」，無法啟動。",
+                    code=ErrorCode.INVALID_STATE,
                 )
 
             try:
@@ -104,7 +110,7 @@ class ProjectMeetingService:
 
         normalized_id = project_id.strip().upper()
         if not normalized_id:
-            raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。")
+            raise ProjectMeetingError("請提供專案 ID，例如 PRJ-001。", code=ErrorCode.INVALID_ARGUMENT)
 
         atomic_claim = getattr(self.project_repository, "claim_for_guild", None)
         if callable(atomic_claim):
@@ -115,7 +121,7 @@ class ProjectMeetingService:
                     allow_existing=True,
                 )
             except ProjectRepositoryError as error:
-                raise ProjectMeetingError(str(error)) from error
+                raise ProjectMeetingError(code=classify_error(error).code) from error
 
         async with self._start_lock:
             try:
@@ -128,11 +134,12 @@ class ProjectMeetingService:
 
             if current_project_id == normalized_id:
                 if project is None:
-                    raise ProjectMeetingError(f"找不到專案 ID：{normalized_id}。")
+                    raise ProjectMeetingError(f"找不到專案 ID：{normalized_id}。", code=ErrorCode.PROJECT_NOT_FOUND)
                 return project
             if current_project_id is not None:
                 raise ProjectMeetingError(
-                    f"這個伺服器已有進行中會議：{current_project_id}。"
+                    f"這個伺服器已有進行中會議：{current_project_id}。",
+                    code=ErrorCode.INVALID_STATE,
                 )
 
         # 不在同一把 Lock 內再次取得 Lock，沿用既有啟動與補償邏輯。

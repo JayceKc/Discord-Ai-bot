@@ -36,6 +36,7 @@ class IntakeSession:
     running: bool = False
     stage: str = "collecting"
     project_id: str | None = None
+    submission_project_id: str | None = None
     change_id: str | None = None
     change: RequirementChange | None = None
     updated_at: float = field(default_factory=time.monotonic)
@@ -54,7 +55,7 @@ class ProjectIntake:
     def get(self, guild_id: int, channel_id: int, user_id: int) -> IntakeSession | None:
         key = (guild_id, channel_id, user_id)
         session = self.sessions.get(key)
-        if session and time.monotonic() - session.updated_at > self.ttl_seconds and not session.running:
+        if session and time.monotonic() - session.updated_at > self.ttl_seconds and not session.running and session.stage != "write_outcome_unknown":
             self.sessions.pop(key, None)
             return None
         return session

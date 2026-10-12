@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from database.db import DatabaseError, MySQLDatabase
+from database.db import readonly_retry, DatabaseError, MySQLDatabase
 from repositories.guild_project_store import GuildProjectStoreError
 
 
@@ -14,15 +14,16 @@ class MySQLGuildProjectStore:
     def __init__(self, database: MySQLDatabase) -> None:
         self.database = database
 
+    @readonly_retry
     async def get_current_project_id(self, guild_id: int) -> str | None:
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT project_id FROM guild_current_projects WHERE guild_id = %s",
                         (guild_id,),
-                    )
-                    row = await cursor.fetchone()
+                    ))
+                    row = await self.database.run(cursor.fetchone())
                     return None if row is None else str(row["project_id"])
         except (DatabaseError, Exception) as error:
             raise GuildProjectStoreError("無法讀取 MySQL Guild 專案狀態。") from error
@@ -31,7 +32,7 @@ class MySQLGuildProjectStore:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         """
                         INSERT INTO guild_current_projects (guild_id, project_id, started_at)
                         VALUES (%s, %s, %s) AS new
@@ -40,6 +41,6 @@ class MySQLGuildProjectStore:
                             started_at = new.started_at
                         """,
                         (guild_id, project_id, datetime.now(timezone.utc)),
-                    )
+                    ))
         except (DatabaseError, Exception) as error:
             raise GuildProjectStoreError("無法保存 MySQL Guild 專案狀態。") from error

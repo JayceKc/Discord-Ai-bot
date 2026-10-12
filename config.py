@@ -2,7 +2,7 @@
 
 from __future__ import annotations  # 延後解析型別註記，提升不同 Python 版本的相容性。
 
-import logging  # Python 內建日誌模組，用來設定輸出格式與等級。
+import math
 import os  # 用來讀取作業系統環境變數。
 from dataclasses import dataclass  # 讓設定類別可以自動產生初始化方法。
 
@@ -14,6 +14,7 @@ class Settings:
     """程式啟動後使用的設定；凍結後可避免執行途中被意外修改。"""
 
     discord_token: str  # Discord Bot 登入憑證，沒有預設值，啟動時一定要提供。
+    discord_guild_id: int = 0  # 清除此伺服器的舊專用指令；正式指令仍採全域同步。
     ollama_host: str = "http://localhost:11434"  # 本機 Ollama 預設服務網址。
     ollama_model: str = "qwen3.5:4b"  # !ask 預設使用的模型名稱。
     ollama_timeout_seconds: float = 300.0  # 等待模型回答的最長秒數。
@@ -35,7 +36,13 @@ class Settings:
     db_pool_min_size: int = 1  # 常駐連線數。
     db_pool_max_size: int = 5  # 同時可用連線上限。
     db_connect_timeout_seconds: float = 10.0  # 建立連線的最長等待時間。
+    db_acquire_timeout_seconds: float = 10.0
+    db_operation_timeout_seconds: float = 30.0
+    db_pool_recycle_seconds: float = 300.0
     project_intake_channel_id: int = 0  # 0 代表自然語言入口尚未啟用。
+    agent_meeting_channel_id: int = 0
+    project_status_channel_id: int = 0
+    dev_log_channel_id: int = 0
     log_level: str = "INFO"  # 預設只顯示 INFO 以上等級的日誌。
 
 
@@ -53,6 +60,7 @@ def load_settings() -> Settings:
     # 建立一個 Settings 物件；環境變數不存在時使用每個欄位的預設值。
     return Settings(
         discord_token=discord_token,  # Token 只保存在設定物件中，不寫進日誌。
+        discord_guild_id=_read_nonnegative_int("DISCORD_GUILD_ID", 0),
         ollama_host=os.getenv("OLLAMA_HOST", "http://localhost:11434").rstrip("/"),  # 移除網址結尾的 /。
         ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b"),  # 允許透過 .env 更換模型。
         ollama_timeout_seconds=_read_positive_float("OLLAMA_TIMEOUT_SECONDS", 300.0),
@@ -89,7 +97,13 @@ def load_settings() -> Settings:
         db_connect_timeout_seconds=_read_positive_float(
             "DB_CONNECT_TIMEOUT_SECONDS", 10.0
         ),
+        db_acquire_timeout_seconds=_read_positive_float("DB_ACQUIRE_TIMEOUT_SECONDS", 10.0),
+        db_operation_timeout_seconds=_read_positive_float("DB_OPERATION_TIMEOUT_SECONDS", 30.0),
+        db_pool_recycle_seconds=_read_positive_float("DB_POOL_RECYCLE_SECONDS", 300.0),
         project_intake_channel_id=_read_nonnegative_int("PROJECT_INTAKE_CHANNEL_ID", 0),
+        agent_meeting_channel_id=_read_nonnegative_int("AGENT_MEETING_CHANNEL_ID", 0),
+        project_status_channel_id=_read_nonnegative_int("PROJECT_STATUS_CHANNEL_ID", 0),
+        dev_log_channel_id=_read_nonnegative_int("DEV_LOG_CHANNEL_ID", 0),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),  # 統一轉成大寫，例如 info 變成 INFO。
     )
 
@@ -97,12 +111,8 @@ def load_settings() -> Settings:
 def configure_logging(log_level: str) -> None:
     """設定基本日誌格式；此函式不接收也不記錄 Discord Token。"""
 
-    # 從 logging 找到同名等級；名稱錯誤時安全地退回 INFO。
-    level = getattr(logging, log_level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,  # 決定最低要顯示哪個等級的訊息。
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",  # 時間｜等級｜模組｜內容。
-    )
+    from core.logging_security import configure_safe_logging
+    configure_safe_logging(log_level)
 
 
 def _read_positive_int(name: str, default: int) -> int:
@@ -148,7 +158,7 @@ def _read_positive_float(name: str, default: float) -> float:
     except ValueError as error:
         raise RuntimeError(f"{name} 必須是數字。") from error
 
-    if value <= 0:  # 逾時秒數必須是正數。
+    if not math.isfinite(value) or value <= 0:  # 逾時秒數必須是正數。
         raise RuntimeError(f"{name} 必須大於 0。")
     return value  # 驗證成功後回傳浮點數。
 
@@ -161,6 +171,6 @@ def _read_nonnegative_float(name: str, default: float) -> float:
         value = float(raw_value)
     except ValueError as error:
         raise RuntimeError(f"{name} 必須是數字。") from error
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         raise RuntimeError(f"{name} 不可小於 0。")
     return value

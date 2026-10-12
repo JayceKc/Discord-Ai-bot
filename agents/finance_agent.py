@@ -43,6 +43,7 @@ class FinanceAgent(StructuredAgent[FinanceAnalysis]):
                 "輸入包含 requirement_change 時，必須重新評估新限制造成的成本或"
                 "風險，不得只表示同意。"
                 "每個分類最多列出 2 項，每項不超過 80 字。"
+                "每項以40～60字的完整短句表達並以句號結束，禁止寫到字數上限才切斷。"
             ),
             # Finance 使用低溫度，讓成本與風險判斷更穩定。
             temperature=0.1,

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from core.errors import AppError, ErrorCode, classify_error
+
 import logging  # 記錄模型名稱、推論時間與 Token 數量。
 import time  # 使用高精度計時器測量 Python 實際等待時間。
 from dataclasses import dataclass  # 建立只保存資料的回覆與統計類別。
 from typing import Any, Mapping, Protocol  # 描述回應型別與可替換的 Client 介面。
 
 import httpx  # Ollama 套件底層連線及逾時錯誤的型別來源。
+from pydantic import ValidationError
 from ollama import AsyncClient, ResponseError  # Ollama 官方非同步 Client 與 API 錯誤。
 
 
@@ -19,7 +22,7 @@ DEFAULT_OLLAMA_MODEL = "qwen3.5:4b"  # 沒有傳入 model 時使用專案預設�
 logger = logging.getLogger(__name__)
 
 
-class LLMServiceError(RuntimeError):
+class LLMServiceError(AppError):
     """呼叫或解析 Ollama API 時發生的可預期錯誤。"""
 
 
@@ -122,20 +125,24 @@ class LLMService:
             response = await self.client.chat(**request)
         except httpx.TimeoutException as error:
             # Ollama 套件底層使用 HTTPX，因此逾時會拋出 HTTPX 例外。
-            raise LLMServiceError("Ollama 回應逾時，請稍後再試。") from error
+            raise LLMServiceError("Ollama 回應逾時，請稍後再試。", code=ErrorCode.OLLAMA_TIMEOUT) from error
         except ResponseError as error:
             # ResponseError 代表 Ollama API 回傳 4xx 或 5xx 等錯誤。
             status_code = getattr(error, "status_code", None)
             status_text = str(status_code) if status_code is not None else "未知"
             raise LLMServiceError(
-                f"Ollama API 回傳錯誤狀態：{status_text}。"
+                f"Ollama API 回傳錯誤狀態：{status_text}。",
+                code=ErrorCode.OLLAMA_MODEL_MISSING if status_code == 404 else ErrorCode.CONFIG_INVALID if status_code in (400, 401, 403) else ErrorCode.OLLAMA_UNAVAILABLE
             ) from error
         except ConnectionError as error:
             # 新版 Ollama Python 在服務未啟動時會包裝成內建 ConnectionError。
-            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error
+            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。", code=ErrorCode.OLLAMA_UNAVAILABLE) from error
         except httpx.RequestError as error:
             # 包含服務未啟動、網址錯誤或網路連線失敗。
-            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。") from error
+            raise LLMServiceError("無法連線到 Ollama，請確認服務是否已啟動。", code=ErrorCode.OLLAMA_UNAVAILABLE) from error
+
+        except (ValidationError, ValueError, TypeError) as error:
+            raise LLMServiceError(code=ErrorCode.LLM_INVALID_OUTPUT) from error
 
         request_duration = time.perf_counter() - started_at  # 結束時間減開始時間即經過秒數。
         # 舊版套件回傳 dict，新版則回傳物件；_read_field 同時支援兩種。
@@ -143,7 +150,7 @@ class LLMService:
         content = _read_field(message_data, "content")
 
         if not isinstance(content, str) or not content.strip():
-            raise LLMServiceError("Ollama 回傳內容缺少 message.content。")
+            raise LLMServiceError("Ollama 回傳內容缺少 message.content。", code=ErrorCode.LLM_INVALID_OUTPUT)
 
         # 解析 Ollama 回傳的效能與 Token 統計。
         usage = LLMUsage(

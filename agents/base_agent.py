@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Mapping, Protocol
 
+from core.errors import ErrorCode
 from agents.errors import (
     AgentError,
     AgentInvalidJSONError,
@@ -27,6 +28,8 @@ class AgentConfig:
     seed: int = 42
     max_output_tokens: int = 500
     json_schema: Mapping[str, object] | None = None
+    # 不同任務可縮短寫作目標；這是提示，不取代 Schema 或 Token 硬上限。
+    text_budget_guidance: str = "每項以40～60字為目標，長章節以120～160字為目標；不得為了湊近上限而截斷句子。"
 
     def __post_init__(self) -> None:
         # 先驗證必要文字，避免建立出無法辨識身份的 Agent。
@@ -75,13 +78,16 @@ class BaseAgent:
 
         user_input = user_input.strip()
         if not user_input:
-            raise AgentError("使用者輸入不可為空。")
+            raise AgentError("使用者輸入不可為空。", code=ErrorCode.INVALID_ARGUMENT)
 
         # 把 Agent 身份與任務提示合併，確保每次呼叫都有一致上下文。
         full_system_prompt = (
             f"Agent 名稱：{self.config.name}\n"
             f"角色：{self.config.role}\n\n"
             f"{self.config.system_prompt}"
+            "\n敘述欄位使用完整短句並以句號收尾。"
+            f"{self.config.text_budget_guidance}"
+            "不得聲稱零風險、絕對可靠或保證如期；未驗證的效果需標示假設與驗證方法。"
         )
         try:
             response = await asyncio.wait_for(
@@ -98,7 +104,7 @@ class BaseAgent:
         except asyncio.TimeoutError as error:
             raise AgentTimeoutError("Agent 等待模型回覆逾時。") from error
         except LLMServiceError as error:
-            raise AgentServiceError(f"Agent 無法取得模型回覆：{error}") from error
+            raise (AgentServiceError if error.code in {ErrorCode.OLLAMA_UNAVAILABLE, ErrorCode.OLLAMA_TIMEOUT, ErrorCode.LLM_INVALID_OUTPUT} else AgentError)(code=error.code) from error
 
         data = None
         if self.config.json_schema is not None:
@@ -108,6 +114,6 @@ class BaseAgent:
             except json.JSONDecodeError as error:
                 raise AgentInvalidJSONError("模型回覆不是合法 JSON。") from error
             if not isinstance(data, (dict, list)):
-                raise AgentError("模型 JSON 回覆必須是物件或陣列。")
+                raise AgentInvalidJSONError("模型 JSON 回覆必須是物件或陣列。")
 
         return AgentResponse(response.content, data, response.usage)

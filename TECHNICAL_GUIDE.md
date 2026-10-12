@@ -1,734 +1,368 @@
-# Discord AI Agent Company 技術文件與踩雷紀錄
+# AI Agent Company 技術文件與踩雷紀錄
 
-## 1. 文件用途
+更新日期：2026-10-12。本文依目前程式整理，不是某一天的實測報告。
 
-這份文件記錄專案架構、Agent 資料流、JSON 狀態、模型限制、測試方式，以及開發過程實際遇到的問題。
+[README](README.md) 負責安裝、啟動與指令操作；本文說明架構、資料、限制與排錯。每次執行前先確認 README 的啟動條件及本文的恢復／安全規則。測試、計畫、每日報告與教學僅保留本機，閱讀本文不需要那些檔案。
 
-每次啟動前先閱讀 [README.md](README.md) 的「啟動前必讀清單」。只有在需要理解原理或排錯時，才閱讀本文件對應章節。
+## 1. 架構與責任邊界
 
-## 2. 系統目標
+### 1.1 系統概念
 
-系統在 Discord 中模擬一個多角色 AI 公司：
-
-1. 使用者從專案清單選擇需求。
-2. PM 拆解需求。
-3. Research 區分已知資訊、推論與待查證事項。
-4. Creative 根據研究提出方案。
-5. Finance 評估成本、限制、風險與替代方案。
-6. 第一輪完成後，允許加入一次需求變更。
-7. 四位 Agent 各自針對需求變更回應一次。
-8. PM 將兩輪討論整合成草案。
-9. Review 檢查四個品質維度。
-10. 草案若不完整，只允許指定 Agent 修改一次。
-11. PM 重新整合並保存最終方案。
-
-## 3. 核心技術
-
-### 3.1 Discord
-
-`bot.py` 使用 `discord.py`：
-
-- `commands.Bot` 處理 `!hello`、`!ask`。
-- `CommandTree` 處理 `/start`、`/draft` 等 Slash Command。
-- `setup_hook()` 執行 `await self.tree.sync()`，否則 Slash Command 不會出現在 Discord。
-- 長時間操作先執行 `interaction.response.defer(thinking=True)`。
-- defer 之後不能再次使用第一次回應，必須改用 `interaction.followup.send()`。
-- `intents.message_content = True` 是文字指令讀取訊息內容的必要設定。
-
-### 3.2 Ollama
-
-正式服務位於 `services/llm_service.py`，使用官方 `ollama.AsyncClient`：
-
-```python
-response = await client.chat(
-    model="qwen3.5:4b",
-    messages=messages,
-    stream=False,
-    think=False,
-    format=json_schema,
-    options={
-        "temperature": temperature,
-        "seed": seed,
-        "num_predict": max_output_tokens,
-    },
-)
-```
-
-重要選項：
-
-- `stream=False`：等待完整結果，方便一次解析 JSON。
-- `think=False`：避免 Qwen 的思考內容消耗有限的輸出預算，導致 `message.content` 空白或 JSON 不完整。
-- `format=json_schema`：要求 Ollama 依 JSON Schema 輸出。
-- `num_predict`：限制最大輸出 Token。
-- `temperature`：控制輸出穩定性與創意程度。
-- `seed`：相同輸入與參數下提高可重現性。
-
-### 3.3 Pydantic
-
-每個專業 Agent 都用 Pydantic v2 定義固定輸出：
-
-```python
-class ExampleAnalysis(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    summary: str
-    items: list[str]
-```
-
-使用方式：
-
-- `model_json_schema()`：產生交給 Ollama 的 JSON Schema。
-- `model_validate_json()`：解析並驗證模型回覆。
-- `extra="forbid"`：模型多輸出未定義欄位時直接拒絕。
-- `Field()`、`StringConstraints`：限制陣列數量及文字長度。
-- `model_validator`：檢查跨欄位規則，例如 Review 顯示「通過」時四項檢查必須全部通過。
-
-結構化輸出採用兩層保護：
+單一 Discord Bot 用五種角色 Embed 呈現 PM、Research、Creative、Finance、Review。角色不是五個 Discord 帳號，也不是五個不同模型；目前共用一個 LLMService，靠角色 Prompt、參數與 Schema 分工。不使用 LangChain 或 CrewAI。
 
 ```text
-Ollama JSON Schema 約束
-        ↓
-Pydantic 再次解析與驗證
-        ↓
-通過後才寫入 meetings.json
+Discord 指令／入口訊息
+  → Bot 與展示層
+  → MeetingManager／UserDecisionService
+  → 專業 Agent → StructuredAgent → BaseAgent
+  → 共用 LLMService → Ollama
+  → Pydantic 與程式品質檢查
+  → Repository → MySQL
+  → Discord 發言、狀態與操作卡
 ```
 
-## 4. 架構分工
+### 1.2 檔案分工
 
-### 4.1 `bot.py`
+| 模組 | 責任 |
+| --- | --- |
+| `bot.py` | 組裝相依物件、註冊指令、處理 Interaction、連接服務與展示 |
+| `config.py` | 讀取環境設定並驗證型別／範圍 |
+| `agents/base_agent.py` | 名稱、角色、System Prompt、生成參數與統一 respond 介面 |
+| `agents/structured_agent.py` | 呼叫 BaseAgent，解析／驗證結構化輸出與回傳用量 |
+| `agents/*_agent.py` | 各角色的專業內容、Schema 與參數 |
+| `services/llm_service.py` | SDK 呼叫、message.content、耗時與 Token 統計、連線錯誤轉換 |
+| `services/meeting_manager.py` | 發言順序、共享 Context、輪次、保存檢查點及失敗恢復 |
+| `services/user_decision_service.py` | 選擇、一次修改、重整、批准／駁回與版本驗證 |
+| `services/project_intake.py` | 自然語言需求收集的暫存階段 |
+| `services/project_submission_service.py` | 建案結果查證，避免不確定寫入被重複提交 |
+| `models/` | 專案、會議、決策與合法狀態 |
+| `repositories/`、`database/` | 資料存取、交易、連線池與 migration |
+| `presentation/`、`views/` | Embed、分頁、進度、頻道路由與持久按鈕 |
+| `core/` | 錯誤分類、安全日誌、恢復與文字完整性檢查 |
 
-負責：
+Bot 不應重複撰寫 SQL、模型解析或角色業務規則。Repository 不負責決定 Agent 如何發言。
 
-- Discord 指令註冊
-- Interaction、defer、Followup
-- Embed 與訊息分段
-- 將服務層錯誤轉成使用者看得懂的訊息
-- 在 `main()` 建立並注入所有相依物件
+### 1.3 設定與共用模型
 
-不負責：
+設定經 `load_settings()` 形成 Settings，再由啟動流程注入服務；正式 LLMService 不自行讀取環境變數。環境中已有的值優先於 dotenv 預設載入的值。
 
-- Agent 商業邏輯
-- JSON 讀寫細節
-- Ollama 回覆解析規則
+[.env.example](.env.example) 使用 `qwen3.5:9b`；程式未取得模型設定時仍以 `qwen3.5:4b` 作為預設。實際模型以執行環境的 OLLAMA_MODEL 為準，不是看 Agent 檔名。換模型後需安裝對應模型並重啟 Bot，不必改每個角色。
 
-### 4.2 `config.py`
+正式服務使用 Ollama Python SDK；手寫 HTTP API 學習版已移除。httpx 仍供 SDK 版辨識連線／逾時錯誤，不應一併移除。
 
-集中讀取 `.env`，避免每個模組自行讀取環境變數。
+## 2. 完整流程
 
-設定優先順序是：
+### 2.1 專案入口與隔離
+
+有兩種入口：
+
+- `/projects` 選取種子專案，再 `/start project_id:...`。
+- 在設定的需求入口頻道描述需求，依 Bot 提示補齊欄位及確認，建立自訂專案。
+
+自然語言入口限定 PROJECT_INTAKE_CHANNEL_ID，設為 0 就關閉。明確啟動句可直接收集，其他句子交由 ProjectIntentAgent 分類；不確定時要求確認，不能因一般聊天就任意建案。填表暫存以 Guild／頻道／使用者區分，Bot 重啟不恢復未完成的對話；已保存的資料仍在 MySQL。
+
+共用種子專案的 owner_guild_id 為 NULL，自訂專案則綁定所屬 Guild。種子專案的狀態是共用的，不是每個伺服器各一份。
+
+Guild Lock 防止同一程序內同一 Guild 重複啟動；資料庫也保存目前專案並檢查交易／版本。不同 Guild 可討論不同專案，但不要同時啟動同一共用種子。此架構不代表可任意運行多個 Bot 副本，記憶體 Lock 並非跨程序分散式鎖。
+
+### 2.2 第一輪與共享內容
+
+固定順序是 PM → Research → Creative → Finance。Review 不在第一輪，因為尚未形成整合草案。
+
+| 角色 | 專業輸出 | 第一輪取得的前文 |
+| --- | --- | --- |
+| PM | 目標、限制、工作、分歧 | 原始需求 |
+| Research | 已知資訊、合理推論、待查證 | PM 的目標、限制、工作及分歧 |
+| Creative | 具體方案、研究依據、實作步驟 | Research 的已知、推論與待查證 |
+| Finance | 成本、限制、風險、替代方案 | PM 限制、Research 已知／待查證、Creative 方案 |
+
+欄位選擇由 MeetingManager 的 RELEVANT_OUTPUT_FIELDS 控制；第二輪使用 SECOND_ROUND_RELEVANT_OUTPUT_FIELDS。後發言者取得的是所需輸出，不是前一位的完整 Prompt。
+
+meeting_context 保存摘要、每輪摘要、建議與來源角色；步驟原文另行保存。存完整歷史不等於每次傳完整歷史。這能控制 Context 大小，但不能消除幻覺；Prompt 要求引用也不代表模型一定引用正確。
+
+### 2.3 需求變更與第二輪
+
+`/change change_id:...` 必須屬於目前專案，一場會議最多套用一次需求變更。四位 Agent 針對新限制或前文各回應一次，不應只說「我同意」。
+
+自然語言入口先展示第一輪草案；「修改：具體內容」才新增變更並進行第二輪。「直接定稿」是進入審查／決策，不代表跳過使用者批准。
+
+也可用 `/meeting project_id:... change_id:...` 一次跑兩輪至決策，兩個參數皆必填；不會自動批准。
+
+### 2.4 PM 整合草案
+
+PM 收到已完成的一輪或兩輪摘要、重要原文、需求及變更，輸出：
+
+- 標題與摘要
+- 背景與目標
+- 整合方案
+- 執行計畫
+- 風險與對策
+- 驗收標準
+- 採用、拒絕與折衷的決策紀錄
+
+草案在 proposal_draft，統計在 proposal_metrics。折衷是取捨，不是把所有矛盾方案都照單全收；需要指出保留什麼、犧牲什麼及理由。
+
+### 2.5 Review、選擇、一次修改與批准
+
+Review 固定輸出「通過」或「需要修改」，評估完整度、創意、可信度、可行性，各為 1～5 整數並有理由。
+
+- 必要問題放 issues，包含問題、修改要求、優先順序及負責 Agent。
+- 非必要偏好／歷史參考放 advisories，不能偽裝成硬性驗收要求。
+- 「通過」要求完整度、可信度、可行性達必要門檻，且 issues 為空；創意偏好不足可有建議，不一定退修。
+- revision_allowed 由程式依狀態及修改次數重新判斷，不直接信任模型。
+
+審查不會直接把初稿存成最終成果。決策流程如下：
+
+```mermaid
+stateDiagram-v2
+    preparing --> awaiting_choice: 草案評分與選項生成
+    awaiting_choice --> applying_choice: 啟動者選擇
+    applying_choice --> awaiting_approval: PM 套用、Review、必要的一次修改
+    awaiting_approval --> approved: 啟動者批准
+    awaiting_approval --> awaiting_choice: 駁回並重新選擇
+```
+
+選項有 2～3 個，需包含討論來源與影響章節。啟動者用按鈕或 /decide 選擇；程式驗證方案實際落實了選項指定的變更，不能只換摘要。
+
+候選方案需要修改且尚有額度時，程式挑選優先問題、交給指定 Agent，保存修改結果，再由 PM 重整並重新審查。**一場會議最多一次自動修改**；重試、駁回或換方向不會重設 revision_count。
+
+候選方案與評分對應後，啟動者可 approve／reject。批准檢查版本與摘要雜湊，**目前不會因 Review 仍顯示「需要修改」而一律禁止批准**；批准者必須閱讀剩餘風險，這不是自動品質保證。
+
+## 3. 資料保存、版本與狀態
+
+### 3.1 正式資料在 MySQL
+
+| Repository | 保存內容 |
+| --- | --- |
+| MySQLProjectRepository | 專案、需求、驗收與變更 |
+| MySQLGuildProjectStore | Guild 的進行中專案 |
+| MySQLMeetingRepository | 會議、步驟、最新會議索引與決策資料 |
+| MySQLWorkspaceRepository | 工作區、優先目標、成果數與同類專案近期經驗 |
+
+新會議保存優先目標與近期完成經驗的快照；之後調整 /priority 只影響下一場，不回頭更改已開始會議。近期成果不是外部查證資料，也不能自動變成新專案的硬需求。
+
+### 3.2 草案與成果在哪裡
+
+以下是 MeetingRecord 的欄位概念，不代表每個欄位都是獨立 SQL 欄位：
 
 ```text
-.env／環境變數
-        ↓
-Settings
-        ↓
-main() 注入各服務
+MeetingRecord
+├── steps                         每位 Agent 的輸入、輸出、輪次、狀態、用量
+├── meeting_context               篩選內容、摘要、建議來源、優先目標快照
+├── applied_requirement_change    本次變更
+├── proposal_draft / proposal_metrics
+├── review_result                 初稿審查
+├── revision_count / revision_output
+├── user_decision                 選項、選擇、影響、評分與歷史
+├── candidate_proposal / candidate_review / candidate_proposal_metrics
+├── final_proposal / final_proposal_metrics
+├── decision_version              決策與舊按鈕防護
+└── storage_version               保存版本防護
 ```
 
-服務層只接收設定值，不應再次自行呼叫 `os.getenv()`，否則測試與正式環境可能讀到不同結果。
+步驟保存 agent_name、order、round_number、input_text、output_data、狀態、字元、Token、耗時與安全錯誤。round_number 是程式寫入的標記：建立第一輪填 1，第二輪填 2；不是 Python 自動猜測輪次。
 
-### 4.3 `services/llm_service.py`
+候選與修改後評分保存在 user_decision.evaluations 及 candidate_review；批准／駁回時將該輪方案與評分記入 user_decision.history。尚未批准的候選內容不算最終成果。
 
-負責：
+### 3.3 兩種狀態不能混淆
 
-- 使用 `AsyncClient` 呼叫 Ollama
-- 解析 `message.content`
-- 記錄 Python 實際等待時間
-- 保存 Prompt、Completion 與總 Token
-- 將連線失敗、逾時及 Ollama API 錯誤轉成 `LLMServiceError`
+MeetingStatus 描述執行階段：pending、running、completed、failed、cancelled。decision_status 描述使用者決策：preparing、awaiting_choice、applying_choice、awaiting_approval、approved。
 
-### 4.4 `agents/base_agent.py`
+單輪 completed 不等於專案已批准。新版成果必須經批准寫入 final_proposal；舊版資料另有相容處理，不應手動改狀態冒充完成。
 
-所有 Agent 的共同底層：
+完成保存時，MySQL Repository 在同一交易內標記專案 completed、釋放 guild_current_projects；guild_latest_meetings 保留最新歷史索引。單輪完成或失敗不會釋放目前專案。
 
-- Agent 名稱
-- 角色
-- System Prompt
-- 逾時
-- temperature
-- seed
-- 最大輸出 Token
-- JSON Schema
-- 統一的 `respond()` 介面
+### 3.4 版本與交易保護
 
-`BaseAgent` 是模型呼叫模板，但不定義 PM 或 Finance 的專業內容。
+- decision_version 擋下舊選項／按鈕；批准時比對候選的版本與 SHA-256，避免接受沒審查過的新內容。
+- storage_version 擋下過期會議寫入；保存前鎖定資料列，檢查版本。
+- 專案啟動、Guild 關聯與會議保存各自使用交易；模型呼叫在資料庫交易外，不長時間持有交易等待推論。
+- 選擇先保存再執行，處理保留期限為 15 分鐘。正常失敗會清除保留；程序中斷時依提示等待期限後重試相同選項。
+- /projects 可隔離異常專案，顯示有效項目及警告；這不是自動修復。啟動單筆仍嚴格驗證，不能自行杜撰缺少的驗收內容。
 
-### 4.5 `agents/structured_agent.py`
+### 3.5 JSON 只用於匯入與相容工具
 
-將 `BaseAgent` 與 Pydantic 串接：
+JsonProjectRepository 供範例匯入等工具使用；JSON Meeting／Guild Repository 也供本機測試替換資料來源。正式 Bot 的啟動組裝使用 MySQL。
 
-1. 呼叫 BaseAgent。
-2. 取得模型 JSON 文字。
-3. 使用指定的 Pydantic 模型驗證。
-4. 回傳結構化結果。
-5. 需要時保留 Token 統計。
+修改根目錄 projects.json、meetings.json 或 guild_projects.json **不會重置正式資料庫**。本文不提供清空正式會議的步驟。重新測試使用新專案或隔離資料庫；範例匯入會更新相同 ID，僅適合空白測試資料庫。
 
-因此每個 Agent 不需要重複撰寫 JSON 解析與格式錯誤處理。
+MySQL migration 位於 database/migrations。Docker 空白 volume 首次初始化會執行；已有 volume 不會補跑新增 migration，也不會因修改 .env 自動改密碼。升級前先備份，不用刪 volume 作為排錯手段。
 
-### 4.6 專業 Agent
+## 4. 模型與輸出預算
 
-| Agent | 主要輸出 | 特性 |
-|---|---|---|
-| PM | 目標、限制、工作項目、分歧 | 低溫度，重視整理 |
-| Research | 已知、推論、待查證 | 禁止把推論當事實 |
-| Creative | 具體方案、研究依據、步驟 | 較高溫度，增加變化 |
-| Finance | 成本、限制、風險、替代方案 | 低溫度，不得捏造金額 |
-| Review | 四項檢查、問題、指定負責人 | 固定通過或需要修改 |
+### 4.1 三層約束
 
-### 4.7 `services/meeting_manager.py`
+LLMService 以非同步 SDK 呼叫 /api/chat，送出 stream=false、think=false；使用角色消息、temperature、seed、num_predict 及指定 JSON Schema，最後解析 message.content。
 
-Meeting Manager 是整個多 Agent 流程的協調者：
+1. BaseAgent 控制呼叫、逾時及生成參數。
+2. StructuredAgent 使用 Pydantic 驗證型別、必填欄位、額外欄位、字串／陣列長度及跨欄位一致性。
+3. 服務層再檢查完整收尾、來源與選項實際影響；格式合法不代表事實可信。
 
-- 固定 Agent 發言順序
-- 建立共享 Context
-- 控制第一輪與第二輪
-- 使用 Guild Lock 防止同一伺服器重複啟動
-- 保存每位 Agent 的輸入、輸出、Token 與耗時
-- 建立 PM 草案
-- 執行 Review、一次修改與最終整合
-- 處理取消、失敗及恢復
+think=false 用來減少思考輸出占用預算，不能保證 JSON 一定完整。固定 seed 與低溫度可提高穩定性，但模型／版本／硬體等仍影響輸出。
 
-### 4.8 Repository
+### 4.2 目前預設值
 
-Repository 隔離資料讀寫。Day 22 正式執行使用非同步 MySQL Repository：
+以 config.py、各角色 AgentConfig 為準：
 
-- `MySQLProjectRepository`：專案、需求、驗收條件與需求變更。
-- `MySQLGuildProjectStore`：每個 Guild 的目前專案。
-- `MySQLMeetingRepository`：會議主檔、Agent 步驟與 Guild 最新會議索引。
-- `MySQLWorkspaceRepository`：Guild 工作區、預設優先目標、成果統計與同類專案最近三筆最終方案。
+| 限制 | 預設 |
+| --- | --- |
+| !ask 輸入／顯示輸出 | 500／1900 字元 |
+| 會議訊息相容預算 | 1900 字元 |
+| 單次 Agent Prompt／結構化回覆 | 6000／4000 字元 |
+| Ollama Client 請求逾時 | 300 秒 |
+| PM 整合草案 | 180 秒、1600 輸出 Token |
+| PM 決策選項 | 180 秒、1400 輸出 Token |
+| PM 套用選擇 | 180 秒、1800 輸出 Token |
+| PM 局部章節修改 | 180 秒、450 輸出 Token |
+| MeetingManager 單一步驟嘗試 | 最多 2 次（含首次），預設間隔 1 秒 |
 
-MySQL 透過 `aiomysql` 連線池存取；`/start` 專案狀態與 Guild 關聯在同一交易中保存，單次會議保存也會在同一交易更新會議主檔、步驟與 Guild 索引。
+全域 Client 的 300 秒不會取消角色層較短逾時的限制。各角色可覆寫參數，需分辨角色與整體設定。
 
-JSON 實作暫時保留作為匯入與測試工具：
+字元不等於 Token：JSON 鍵、標點與中文都占預算。Python 請求耗時也不等於 Ollama 純推論時間，包含等待與其他請求工作。統計缺失就顯示缺失，不猜總 Token。
 
-- `JsonProjectRepository`：讀取 `projects.json`
-- `JsonGuildProjectStore`：保存每個 Guild 目前專案
-- `JsonMeetingRepository`：保存會議與 Agent 發言
+### 4.3 截斷與局部修復
 
-服務只依賴 Repository Protocol，因此測試可以換成記憶體 Fake Repository，不必碰正式 JSON。
+PM 選擇套用採較短文字目標，Schema 硬上限仍保留。若驗證指出部分章節未收尾，現行修復流程可要求 PM 只重寫那些章節，再合併與重新驗證，不要求每次重生成整篇。
 
-Day 23 加入 `projects.owner_guild_id`。`NULL` 是原有共用種子專案，自訂專案只對所屬 Guild 可見且只允許該 Guild 啟動。自然語言入口透過 `MySQLProjectRepository.create_custom_project()` 以單一交易建立專案、需求及驗收條件；需求變更只在使用者看過第一輪草案並提出修改時另行保存。新會議開始前會將工作區優先目標及最近三筆經驗存入 `meeting_context`；其後調整 `/priority` 不會改動已開始會議的快照。完整會議成果以 `final_proposal IS NOT NULL` 判斷，不只看 `meetings.status`。舊的 `/custom_project` Slash Command 已移除，Repository 方法仍保留。
+這是模型輸出格式／完整性修復，**不是增加一次業務方案修改額度**。仍受最大嘗試、Schema、文字預算與逾時限制，不會無限重試。
 
-自然語言入口由 `PROJECT_INTAKE_CHANNEL_ID` 限定單一 Discord 頻道，預設 `0` 為關閉。`ProjectIntake` 以 Guild／頻道／使用者識別暫存對話狀態。明確符合 `START_PATTERN` 的句子直接開始收集，不呼叫模型；其他訊息交給 `ProjectIntentAgent`，以 Pydantic 限制為 `create_project`、`not_project` 或 `uncertain`，並限制標題、信心值及理由。只有 `create_project` 且信心值至少 `0.8` 才建立記憶體草稿，並先要求使用者確認模型理解到的名稱；確認前不寫入資料庫。模型逾時、服務失敗或 JSON 無效時只顯示固定輸入範例。
+排查順序：服務與模型是否可用 → 請求耗時 → 輸出 Token 是否到頂 → 字元／Schema／未收尾欄位 → Prompt 是否太長。不是遇到 error 就全面放寬限制；Schema 太複雜或能力不足也可能失敗。
 
-使用者確認意圖及完整欄位後，Bot 建立沒有預設變更的自訂專案，執行第一輪並展示 PM 草案；「直接定稿」跳到 Review，「修改：…」才新增 `requirement_changes` 並執行第二輪、重新整合及審查。入口使用 `on_message` listener，不覆蓋既有 prefix command 處理；Bot 重啟不會恢復對話階段，但已保存的專案／會議仍在 MySQL。若 Guild 已有目前專案，入口在寫入前停止。
+### 4.4 可解釋品質分數
 
-最終方案寫入 `MySQLMeetingRepository.save()` 時，若 `meetings.status = completed` 且 `final_proposal` 非空，Repository 會在同一交易內將仍屬於該 Guild 的進行中專案標為 `completed`，並刪除該 Guild 的 `guild_current_projects` 關聯。`guild_latest_meetings` 保留舊會議索引供歷史和使用量查詢；新會議開始時，`MeetingManager` 容許上一場已有最終方案的不同專案，新紀錄保存後會更新最新會議索引。僅單輪完成或會議失敗時不釋放。
-
-### 4.8 Day 24 可解釋方案評估
-
-Review Agent 的四項 checklist 使用 1～5 整數分數與理由；Pydantic 在模型輸出邊界拒絕布林值、非整數及超出範圍的數值。`services/quality_evaluator.py` 不採信模型計算的總分，而是依 `MeetingContext.priority_snapshot` 套用版本化的 `day24-v1` 固定權重：
+Review 提供四項 1～5 整數，Python 依優先目標計算加權分數，不採信模型算出的總分：
 
 | 優先目標 | 完整度 | 創意 | 可信度 | 可行性 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | 成長 | 30% | 25% | 15% | 30% |
 | 成本效益 | 20% | 10% | 25% | 45% |
 | 品牌影響 | 25% | 20% | 40% | 15% |
 | 創新 | 20% | 45% | 15% | 20% |
 
-公式為 `weighted_score = Σ(score × weight)`，再以 `quality_index = weighted_score / 5 × 100` 換算為 0～100。Python 依低於 4 分的面向產生固定風險及改善建議，確保相同 Review 輸入和優先目標得到完全相同輸出。評估包含公式版本、受評方案、目標、四項分數、理由、權重、總分、品質指標、級別、風險、改善建議與文字說明。草案評分附加在 `meetings.review_result.quality_evaluation`；若修改過一次，PM 整合最終方案後再次呼叫 Review，修改後評分附加在 `meetings.review_result.post_revision_review.quality_evaluation`。兩次評分分開顯示，沿用現有 JSON 欄位，不需要 schema migration。第二次 Review 不會觸發額外修改。
+公式版本為 day24-v1：weighted_score = Σ(score × weight)，quality_index = weighted_score / 5 × 100。保留評分理由、受評版本、權重與風險。相同輸入得到相同計算結果，但**總分高不等於審查通過，更不等於已批准**。
 
-## 5. 完整會議流程
+## 5. Discord 展示與查詢
 
-### 5.1 第一輪 `/start`
+### 5.1 Interaction 與狀態頻道
 
-固定順序：
+長時間操作先 defer，後續更新原回應或送 followup，不能再用第一次 response.send_message。
 
-```text
-PM → Research → Creative → Finance
-```
+公開狀態卡與 /status 不同：
 
-Review 不在第一輪，因為此時還沒有 PM 整合草案。
+- 狀態頻道：Bot 更新供大家查看的階段卡。
+- /status：每次指令回傳私人查詢卡，必須完成本次 Interaction，不能只編輯上一張卡。
+- 決策成功提示是保存確認，不會自動執行 /status。
 
-每個 Guild 同一時間只能有一場會議。不同 Guild 可以同時執行，因為 Lock 以 Guild ID 分開保存。
+公開 defer 後的錯誤要經 safe_error_reply 處理，不能只加 ephemeral 就假設不會公開；無法確認回覆狀態時不冒險送出敏感細節。
 
-### 5.2 共享內容
+### 5.2 角色卡片與訊息長度
 
-後面的 Agent 不會取得前面 Agent 的完整 Prompt，只取得需要的輸出欄位：
+agent_profiles 定義角色名稱、emoji、色碼。message_chunks 按 Embed description、fields、總長度等限制分頁，保留換行並預留頁碼與識別資訊。正式展示可能有多頁，不能只用 1900 字元推斷所有 Embed 限制。
 
-- Research 讀取 PM 的目標、限制、工作與分歧。
-- Creative 讀取 Research 的已知資訊、推論與待查證事項。
-- Finance 讀取 PM 限制、Research 內容與 Creative 方案。
+技術用量送到 dev-log／終端機，不把完整 Prompt 寫進 Discord 技術日誌。討論內容本身仍會傳到 Discord。
 
-這些規則由 `RELEVANT_OUTPUT_FIELDS` 與 `SECOND_ROUND_RELEVANT_OUTPUT_FIELDS` 控制。
+### 5.3 路由與去重
 
-目的：
+設定入口、會議、狀態與 dev-log 四種頻道，路由檢查 Guild 與權限。公開用途的傳送遇到 Forbidden／NotFound（403／404），且有不同的原頻道可用時，才可能回退原頻道；dev-log 不用這種回退。
 
-- 降低 Context 膨脹
-- 減少重複資訊
-- 降低模型混淆與幻覺
-- 控制 Prompt 時間與記憶體用量
+網路、timeout 或 5xx 可能已送出但回應丟失，不能盲目補發，否則可能出現兩張操作卡。狀態卡編輯失敗與一般新訊息回退也不是完全相同的路徑。
 
-### 5.3 第二輪 `/change`
+狀態卡索引在 .runtime/status_messages.json，重啟後可恢復編輯原卡；不要隨意刪除索引。歷史上已重複的卡不會自動消失。決策按鈕的 message／channel／version 保存在 decision_messages，啟動時恢復持久 View；按下後服務仍檢查啟動者與版本。
 
-一場會議最多加入一次需求變更。
+### 5.4 指令同步與畫面清理
 
-每位 Agent 必須針對新限制補充、反對或修正，不允許只回覆「我同意」。每位 Agent 在第二輪只回應一次。
+setup_hook 同步全域 CommandTree。DISCORD_GUILD_ID 用於清除指定伺服器的舊專用指令，不是立即同步開關。邀請需要 applications.commands；文字入口另需 Message Content Intent。
 
-### 5.4 PM 草案 `/draft`
+/cleanup 需操作者有 Manage Messages，掃描本頻道最近 100 則，只刪本 Bot 訊息。**訊息刪除不可復原，也不會清除 MySQL 專案或取消會議。** 不用新增重複指令或清空資料來解決畫面問題。
 
-PM 收到已完成的一輪或兩輪內容：
+## 6. 錯誤、保存結果與恢復
 
-- 第一輪摘要
-- 第二輪摘要（若使用者提出變更）
-- 重要原文
-- 專案需求與需求變更
+### 6.1 錯誤卡與日誌
 
-固定輸出：
+core/errors 按型別、代碼與 cause 分類；ErrorHandler 統一記錄並由 error_presenter 產生固定安全訊息，不直接反射原始例外。
 
-- 標題
-- 摘要
-- 專案背景與目標
-- 整合方案
-- 執行計畫
-- 風險與對策
-- 驗收標準
-- 採用、拒絕與折衷決策
+錯誤卡提供原因、保存狀態、下一步與查詢代碼。日誌在**執行 Bot 的終端機**；本專案基本 logging 不等於已設定固定日誌檔。用同一查詢代碼追蹤，不把整份 .env 或原始 SQL 錯誤貼到聊天室。
 
-草案保存在 `proposal_draft`，統計保存在 `proposal_metrics`。
+### 6.2 保存結果要區分
 
-### 5.5 Review 與最終方案 `/review`
+| 結果 | 含義 | 操作原則 |
+| --- | --- | --- |
+| not_started | 尚未進行寫入 | 修正輸入／環境後照提示操作 |
+| rolled_back | 已回滾 | 依錯誤卡重試 |
+| committed | 已保存 | 查狀態，避免重複提交 |
+| unknown | 無法確定是否保存 | 先查證，不假設「失敗就沒寫入」 |
 
-Review 檢查：
+MySQL 連線池與資料庫操作有各自期限，預設 acquire 10 秒、operation 30 秒、recycle 300 秒。借出前驗證連線；交易中不透明重連或重播寫入。唯讀暫時失敗最多兩次總嘗試，寫入不自動重播。commit 回應不明時保留不確定狀態，不能再寫過期快照掩蓋它。
 
-1. 完整度
-2. 創意
-3. 可信度
-4. 可行性
+建案遇到不確定寫入時，ProjectSubmissionService 以實際生成的主鍵查證，不靠相似名稱猜測並重建專案。
 
-若通過，初稿直接成為最終方案。
+### 6.3 如何恢復
 
-若需要修改：
+- 討論 Agent 失敗：查 /status，依提示 /resume 接續檢查點。
+- 初稿／審查失敗：依當前階段使用 /draft 或 /review，不手動改 JSON。
+- 選擇套用失敗：照提示 /decide 重試相同選項；尚在保留期間時等待，不改其他選項或版本。
+- 私人錯誤回覆失敗：不轉送公開頻道。
+- 服務已保存、Discord 發送失敗：不把它改成模型失敗，也不重做已完成的保存。
+- Bot 重啟：持久會議及按鈕可恢復，不代表未完成自然語言填表或所有 in-flight 任務會自動接續。
 
-1. 每項問題提供 `problem`、`required_change`、`priority`、`assigned_agent`。
-2. 程式選擇最高優先級問題。
-3. 將同一負責人的要求交給指定 Agent。
-4. 修改成功後將 `revision_count` 設為 `1`。
-5. PM 重新整合 `final_proposal`。
-6. 再次執行 `/review` 只讀取快取，不會開始第二次修改。
+暫時資料庫錯誤可延後持久 View 恢復，背景每 30 秒重試；成功或永久錯誤停止。Discord 同步網路失敗留下安全事件，服務恢復後重啟同步。不是所有失敗都能靠 /resume 解決。
 
-## 6. 狀態與 JSON
+## 7. 安全與資料生命週期
 
-### 6.1 `projects.json`
+本機模型推論不等於整個系統離線：Discord 接收發言，MySQL 保存完整輸入／輸出。需求可能包含個資，送出前先確認分享範圍。
 
-保存：
+日誌可記查詢代碼、階段、識別碼、模型、字元、Token、耗時及安全摘要；不記登入 Token、密碼、完整 Prompt 或未處理敏感例外。安全日誌在載入設定前啟用，並更新秘密值遮蔽；未知例外仍只顯示固定錯誤，不展示私人內容。
 
-- 專案 ID
-- 類別
-- 標題
-- 需求
-- 預算
-- 期限
-- 驗收條件
-- 專案狀態
-- 至少五種需求變更案例
+.gitignore 排除 .env、會議備份、.runtime、日誌、測試及開發紀錄；不會抹除已提交的歷史。若 Token／密碼曾外洩，撤銷或換新，不只刪檔。
 
-### 6.2 `guild_projects.json`
+MySQL volume、私人匯出與備份必須另外管理，Git 不是資料庫備份。刪 Discord 訊息、刪 JSON、修改 .env、解除 Git 追蹤，分別影響不同層，不是同一個「重置」。
 
-保存 Guild 目前啟動的專案。它不代表完整 Agent 討論內容。
+## 8. 踩雷速查
 
-### 6.3 `meetings.json`
+以下是開發時遇到的問題與目前處理方式；不是宣稱本次重做全部實機驗收。
 
-主要結構：
+| 問題 | 判斷與目前做法 |
+| --- | --- |
+| Ollama address already in use | 11434 已被程序占用，先查設定主機的 /api/tags；不要重複 serve 或殺未知程序 |
+| Slash Command 看不到／兩個 status | 查 Scope、全域同步、登入、客戶端快取；清舊 Guild 副本，不再新增副本 |
+| defer 後仍思考中 | 必須完成本次 Interaction；狀態卡編輯不能代替這次私人回覆 |
+| Agent 執行失敗 | 從代碼判斷連線、逾時、JSON、Schema、字元或完整性問題，不把所有錯誤都歸為模型太小 |
+| 有 Token，content 卻空白 | 檢查 thinking、輸出預算與實際回覆；think=false 不是萬靈丹 |
+| PM 草案／套用選擇逾時 | 比對角色期限與耗時，區分整體 Client 和角色層限制 |
+| 加大上限仍失敗 | 可能是 Schema、Prompt、未收尾章節；先做短目標與局部修復 |
+| Context 越來越長 | MySQL 保存完整原文，模型只收相關欄位與受控摘要 |
+| 固定 Seed 結果仍不同 | 不保證跨版本、硬體或輸入差異時逐字一致 |
+| Fake 全過，真實模型失敗 | Fake 驗流程，實機另驗模型品質與環境 |
+| 改 Prompt 卻看到舊草案 | 已保存內容可被復用，使用新測試專案，不清空正式紀錄 |
+| completed 卻不能開新專案 | 可能只完成一輪，先確認使用者批准與 final_proposal，不手改狀態 |
+| Review 不停修改 | 程式鎖定一次業務修改；再次審查或駁回不補額度 |
+| 選 A 卻說章節沒改 | 選項必須實際改變指定內容，檢查來源、影響章節與完整性 |
+| 同一狀態出現兩張卡 | 區分私人查詢與公開卡，保留索引；送出結果不確定時不補發 |
+| Git 誤加入私人檔案 | 查 status 與 staged diff；忽略已追蹤檔仍需解除追蹤，本機檔不必刪除 |
 
-```text
-guilds
-└── guild_id → meeting_id
+## 9. 開發者本機驗證
 
-meetings
-└── meeting_id
-    ├── status
-    ├── steps
-    ├── meeting_context
-    ├── applied_requirement_change
-    ├── proposal_draft
-    ├── proposal_metrics
-    ├── review_result
-    ├── revision_count
-    ├── revision_agent_name
-    ├── revision_output
-    ├── final_proposal
-    └── final_proposal_metrics
-```
+此節供持有本機測試檔的開發者。**GitHub 發佈版不包含 tests、manual test、scripts/test_*、計畫或報告；一般使用者依 README 啟動即可。** 不要求下載者先跑不存在的檔案。
 
-每個 `steps` 項目會保存：
-
-- Agent 名稱
-- 發言順序
-- 討論輪次
-- 狀態
-- 輸入與輸出
-- 輸入與輸出字元
-- Prompt 與 Completion Token
-- 最大輸出 Token
-- 執行時間
-- 安全錯誤訊息
-
-### 6.4 會議狀態
-
-```text
-pending → running → completed
-                  ↘ failed → running
-                  ↘ cancelled
-```
-
-`completed` 表示目前階段完成，不一定代表整個專案生命週期永久結束。第二輪流程會在既有會議紀錄上繼續增加步驟。
-
-### 6.5 何時重置 JSON
-
-正常使用不要手動重置，因為系統需要先前輪次、草案與修改次數。
-
-只有想完全重新測試整條流程時，先停止 Bot，再將 `meetings.json` 改成：
-
-```json
-{
-  "guilds": {},
-  "meetings": {}
-}
-```
-
-必要時也將 `guild_projects.json` 改成 Repository 預期的空白結構。不要在 Bot 執行途中修改 JSON，否則記憶中的流程與磁碟狀態可能不一致。
-
-## 7. 長度、Token 與逾時
-
-### 7.1 字元不等於 Token
-
-- 字元限制保護 Discord 訊息與 JSON 大小。
-- Token 限制控制模型可以產生多少內容。
-- 中文一個字不一定等於一個 Token。
-- JSON 欄位名稱、括號與標點也會計入字元與 Token。
-
-因此系統同時記錄：
-
-- `input_characters`
-- `output_characters`
-- `prompt_tokens`
-- `completion_tokens`
-- `max_output_tokens`
-
-達限制 80% 顯示 `⚠️`，達 95% 顯示 `🚨`。
-
-### 7.2 目前預算
-
-| 項目 | 預設值 |
-|---|---:|
-| `!ask` 輸入 | 500 字元 |
-| `!ask` 輸出 | 1900 字元 |
-| Discord 會議單段 | 1900 字元 |
-| 單次 Agent Prompt | 6000 字元 |
-| 單次結構化回覆 | 4000 字元 |
-| Ollama 整體請求逾時 | 300 秒 |
-| PM 整合逾時 | 180 秒 |
-
-不同 Agent 另外設定自己的 `max_output_tokens`。PM 整合草案目前為 1600 Token。
-
-### 7.3 為什麼不是一直調高上限
-
-上限太低會截斷 JSON；但無限制調高也會造成：
-
-- 回覆時間增加
-- Context 變大
-- 小模型更容易離題或重複
-- JSON 格式失敗時浪費更多時間
-- Discord 最終仍有訊息限制
-
-先查看實際統計，再決定是否調整。不要因為一次失敗就直接把所有限制加倍。
-
-## 8. 測試策略
-
-### 8.1 Fake Response 的用途
-
-Fake 測試不啟動 Ollama，主要驗證：
-
-- 呼叫參數是否正確
-- Agent 是否解析 JSON
-- Pydantic 是否拒絕錯誤格式
-- Agent 順序是否固定
-- Guild Lock 是否有效
-- 狀態是否保存
-- 最多修改一次是否有效
-- Discord 訊息是否超過上限
-
-它不是多餘程式碼，而是避免每次改動都花數十秒呼叫模型。
-
-### 8.2 手動模型測試
-
-`manual_test.py` 測試官方 Ollama Python 套件版本。
-
-`manual_testapi.py` 測試直接呼叫 HTTP `/api/chat` 的版本。
-
-目前正式 Bot 使用 `services/llm_service.py` 的 Ollama Python 套件；`llm_serviceapi.py` 保留作為學習與比較用途。
-
-### 8.3 修改後的最低驗證
+本機有 tests 時，可在根目錄的虛擬環境執行：
 
 ```bash
 python -m unittest discover -s tests
-python -m py_compile bot.py agents/*.py models/*.py services/*.py repositories/*.py
-python -m json.tool projects.json
 git diff --check
 ```
 
-## 9. 實際踩過的雷
+Fake 驗證呼叫參數、Schema、Agent 順序、Lock、保存、版本、一次修改與展示錯誤。跳過實機測試不算實機通過，預期失敗情境的 WARNING／ERROR 也不等於測試失敗。
 
-### 雷 1：Ollama address already in use
+本機有 manual_test.py 且 Ollama 可用時，才能用它驗證真實推論；會實際送出請求。MySQL／Ollama 故障驗收使用隔離測試環境，不停止正式服務來製造錯誤。
 
-錯誤：
+新增功能順序：資料模型／狀態 → Schema／Prompt → Fake → 服務編排 → Discord → 整合驗收。從 /projects 到批准成果的完整實測仍需真實服務、權限及測試資料，不能只用單元測試或歷史截圖宣稱完成。
 
-```text
-Error: listen tcp 127.0.0.1:11434: bind: address already in use
-```
+## 10. 參考與閱讀順序
 
-原因：已經有 Ollama 程序監聽 11434，再執行一次 `ollama serve` 才會衝突。
+- 安裝、環境、所有指令及圖片：[README](README.md)。
+- 設定範例：[.env.example](.env.example)。
+- 新專案：依 README 設定自然語言入口建案；examples 僅保留開發者本機，不包含在 GitHub。
+- 實作細節：agents、services、repositories、presentation、views、core 的原始碼。
+- 套件文件：[discord.py](https://discordpy.readthedocs.io/en/stable/)、[Ollama Python](https://github.com/ollama/ollama-python)、[Pydantic](https://docs.pydantic.dev/)、[Docker Compose](https://docs.docker.com/compose/)。
 
-正確判斷：
-
-```bash
-curl http://127.0.0.1:11434/api/tags
-```
-
-有回應代表服務正常，不要重複啟動。
-
-### 雷 2：Slash Command 寫好了但 Discord 看不到
-
-可能原因：
-
-- 邀請 Bot 時缺少 `applications.commands` Scope
-- 沒有執行 `CommandTree.sync()`
-- Bot 尚未重新啟動
-- Discord 客戶端快取尚未更新
-- Bot 沒有伺服器或頻道權限
-
-本專案在 `MyBot.setup_hook()` 同步全域指令。新增指令後必須重啟 Bot。
-
-### 雷 3：defer 後再次使用 response
-
-Interaction 第一次回覆只能使用一次。執行：
-
-```python
-await interaction.response.defer(thinking=True)
-```
-
-後續必須使用：
-
-```python
-await interaction.followup.send("完成")
-```
-
-不能再呼叫 `interaction.response.send_message()`。
-
-### 雷 4：PM、Research 或 Finance 顯示「執行失敗」
-
-Discord 只顯示安全錯誤，真正原因通常在底層例外或終端日誌：
-
-- Ollama 沒有啟動
-- 模型沒有下載
-- 回覆逾時
-- 模型輸出不是合法 JSON
-- JSON 缺少必要欄位
-- 多輸出 Schema 不允許的欄位
-- 陣列或文字超過 Pydantic 上限
-- Prompt 或回覆超過字元預算
-- 輸出 Token 用完，JSON 在中途被截斷
-
-排錯順序：
-
-1. `curl /api/tags` 確認 Ollama。
-2. `ollama list` 確認 `qwen3.5:4b`。
-3. 執行 `manual_test.py`。
-4. 查看 `meetings.json` 失敗步驟的輸入、字元與時間。
-5. 查看終端日誌。
-6. 再檢查 Agent Schema 與 Prompt。
-
-### 雷 5：Qwen 有 Token 使用量但 `message.content` 空白
-
-Qwen 可能把有限的 `num_predict` 用在 thinking 階段，導致真正回答沒有剩餘空間。
-
-本專案在 Ollama request 設定：
-
-```python
-"think": False
-```
-
-不要在不理解影響時移除這項設定。
-
-### 雷 6：PM 草案一直逾時
-
-PM 整合兩輪摘要比一般 Agent 工作量大。原本沿用較短逾時，模型可能在即將完成前被取消。
-
-目前：
-
-- PM Integration Agent：180 秒
-- Ollama Client：300 秒
-
-如果模型實際需要 70～90 秒，這不代表當機。先查看執行時間，再判斷是否調整。
-
-### 雷 7：增加輸出上限不一定解決問題
-
-格式錯誤可能來自 Prompt 不清楚、Schema 太複雜或模型能力不足，而不只是上限太小。
-
-先查看：
-
-- Completion Token 是否接近上限
-- 輸出字元是否接近 4000
-- Pydantic 是缺欄位、型別錯誤還是多欄位
-
-只有確定被截斷時才提高 Token。
-
-### 雷 8：Context 全部塞進 Prompt
-
-把所有 Agent 的完整 Prompt 與輸出交給下一位 Agent，會讓內容快速膨脹，也更容易讓小模型混淆來源。
-
-本專案改成：
-
-- 保存完整原文到 JSON
-- 傳遞時只選取相關欄位
-- 每輪另外保存摘要
-- 每項建議記錄提出者
-
-資料庫或 JSON 可以保存完整歷史，但送給模型的 Context 必須經過選擇。
-
-### 雷 9：固定 Seed 不代表每次百分之百相同
-
-Seed、temperature、模型版本、Ollama 版本、硬體與 Prompt 都可能影響結果。
-
-低 temperature 與固定 Seed 只能提高穩定性，不代表輸出文字保證完全一致。
-
-### 雷 10：Fake 測試成功，但正式模型仍失敗
-
-Fake Response 已經是預先準備好的合法資料，因此主要測試程式流程。真實模型仍可能逾時、離題或輸出錯誤格式。
-
-所以需要兩種測試：
-
-```text
-單元測試：快速、穩定、驗證程式邏輯
-手動測試：較慢、驗證 Ollama 與真實模型
-```
-
-### 雷 11：`meetings.json` 的快取讓結果看起來沒有更新
-
-`/draft` 與 `/review` 會優先讀取已保存結果，避免重複消耗模型時間。
-
-修改 Prompt 後直接重跑相同指令，可能看到舊草案。要完整重測：
-
-1. 停止 Bot。
-2. 備份需要保留的紀錄。
-3. 重置 `meetings.json`。
-4. 重新啟動 Bot。
-5. 從 `/start` 開始完整流程。
-
-### 雷 12：`completed` 不等於 JSON 自動知道會議結束
-
-JSON 只是保存字串，真正理解狀態的是 Python：
-
-- `MeetingStatus` 定義合法值。
-- `can_transition_to()` 定義合法轉換。
-- Meeting Manager 根據狀態決定能否繼續。
-
-手動把 JSON 改成 `completed` 不會自動補齊缺少的 Agent 輸出。
-
-### 雷 13：一個 Guild 不能同時開兩場會議
-
-這是刻意限制，不是 Bug。Guild Lock 防止重複啟動和 JSON 相互覆寫。
-
-不同 Discord 伺服器有不同 Guild ID，因此可以同時進行不同會議。
-
-### 雷 14：Review 不能無限要求修改
-
-Review 模型輸出的 `revision_allowed` 不被直接信任，程式會根據 `revision_count` 重新決定。
-
-`revision_count` 的合法值只有 `0` 和 `1`。修改成功後就固定為 1，再次執行 `/review` 只讀取最終方案。
-
-### 雷 15：Git 把不該上傳的檔案加入暫存
-
-不要習慣直接執行：
-
-```bash
-git add .
-```
-
-因為 `.DS_Store`、備份 JSON、報告或執行資料可能一起進入暫存。
-
-先看：
-
-```bash
-git status --short
-```
-
-只加入需要的路徑。誤加入 `docs` 時可取消：
-
-```bash
-git restore --staged docs/
-```
-
-這只取消暫存，不會刪除本機檔案。
-
-### 雷 16：不要提交 `.env`
-
-`.env` 含 Discord Token。即使之後刪除，Token 仍可能留在 Git 歷史。
-
-若 Token 曾經推到 GitHub，不能只刪檔案，必須立即到 Discord Developer Portal 重新產生 Token。
-
-## 10. 日誌與安全
-
-目前日誌會記錄：
-
-- Guild ID
-- 專案 ID
-- 模型名稱
-- 字元數
-- Token 數
-- 執行時間
-- 安全錯誤摘要
-
-不應記錄：
-
-- Discord Token
-- `.env` 完整內容
-- 使用者私人 Prompt 全文
-- 未處理的敏感例外內容
-
-`meetings.json` 會保存完整 Agent 輸入與輸出，因此不要提交到公開 GitHub。
-
-## 11. 開發新功能時的檢查順序
-
-1. 先定義資料模型與合法狀態。
-2. 再定義 Agent Schema 與 Prompt。
-3. 使用 Fake Response 測試成功與失敗。
-4. 接入 Meeting Manager。
-5. 最後接 Discord 指令與 Embed。
-6. 執行全部測試。
-7. 使用真實 Ollama 手動測試。
-8. 檢查 `git status`，確認沒有 Token、會議 JSON 或系統檔案。
-
-## 12. 官方文件
-
-- discord.py：<https://discordpy.readthedocs.io/>
-- Discord Developer Portal：<https://discord.com/developers/applications>
-- Ollama Python：<https://github.com/ollama/ollama-python>
-- Ollama API：<https://github.com/ollama/ollama/blob/main/docs/api.md>
-- Pydantic：<https://docs.pydantic.dev/>
-
-
-## 13. Day 25 使用者決策
-
-新會議在第一次保存前寫入 `decision_owner_user_id` 與 `decision_status=preparing`。Agent 執行狀態仍由 `MeetingStatus` 表示，使用者決策另有狀態：
-
-```mermaid
-stateDiagram-v2
-    preparing --> awaiting_choice: 草案評分與選項生成
-    awaiting_choice --> applying_choice: 使用者選擇
-    applying_choice --> awaiting_approval: PM 套用、Review 重評
-    awaiting_approval --> approved: 批准
-    awaiting_approval --> awaiting_choice: 駁回並改選
-```
-
-- `models/user_decision.py` 驗證來源、2～3 個唯一選項與影響章節；`agents/pm_agent.py` 使用獨立的決策與套用選擇 schema。
-- `services/user_decision_service.py` 共用授權、選擇、評分、批准與駁回流程；Bot/View 不直接執行 SQL。
-- `views/decision_view.py` 提供持久 View，啟動時依 `decision_messages` 重新 `add_view`。按鈕與 `/decide` 呼叫同一服務。
-- `candidate_review` 包含受評方案 SHA-256 與決策版本。批准時檢查兩者，避免接受未評分的新內容。
-- `decision_version` 阻擋舊按鈕，`storage_version` 阻擋所有過期會議寫入。MySQL 保存前鎖住會議列，檢查版本，再於同一交易保存主檔、步驟與完成狀態；模型呼叫在交易外執行。
-- 使用者選擇先保存，處理保留 15 分鐘。正常失敗會解除保留以便重試；程序中斷後等保留到期即可續跑。已保存的候選方案與相同輸入的成功審查／修改步驟可復用。
-- 草案 Review 保存在 `review_result`；候選與自動修改後評分保存在 `user_decision.evaluations` 及最新 `candidate_review`。批准／駁回時將該輪評分、影響與方案一起保存至 `user_decision.history`。
-- 只有 `approved` 的新版方案可寫入 `final_proposal`，進而觸發專案完成與 Guild 釋放。等待期間不納入近期完成經驗；`legacy` 會議保持舊格式相容。
-
-Day 25 的版本欄位需先套用 `003_day25_user_decision.sql`，再啟動新版 Bot。單一會議原有的一次自動修改限制不因駁回而重設。
+本文的專案行為以目前原始碼為準；外部套件版本升級時應重新核對官方文件並驗證。模型說法、品質分數、過往成功截圖都不能替代事實查證或當次驗收。

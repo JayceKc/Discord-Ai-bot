@@ -1,15 +1,16 @@
 """以 MySQL 保存 Project 與 RequirementChange。"""
 
 from __future__ import annotations
+from core.errors import ErrorCode, classify_error
 
 from collections import defaultdict
 from datetime import date
 from typing import Any
 from uuid import uuid4
 
-from database.db import DatabaseError, MySQLDatabase
+from database.db import readonly_retry, DatabaseError, MySQLDatabase
 from models.project import Project, ProjectDataError, ProjectStatus, RequirementChange
-from repositories.project_repository import ProjectRepositoryError
+from repositories.project_repository import ProjectListing, ProjectRepositoryError
 
 
 class MySQLProjectRepository:
@@ -19,15 +20,25 @@ class MySQLProjectRepository:
         self.database = database
 
     async def list_for_guild(self, guild_id: int) -> list[Project]:
+        return (await self.list_for_guild_with_issues(guild_id)).projects
+
+    @readonly_retry
+    async def list_for_guild_with_issues(self, guild_id: int) -> ProjectListing:
+        """僅清單可隔離異常資料；直接讀取或啟動仍須通過完整驗證。"""
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT id, category, title, budget, deadline, status, owner_guild_id "
                         "FROM projects WHERE owner_guild_id IS NULL OR owner_guild_id = %s "
                         "ORDER BY id", (guild_id,),
+                    ))
+                    invalid_rows: list[str] = []
+                    projects = await self._build_projects(
+                        cursor, list(await self.database.run(cursor.fetchall())),
+                        invalid_rows=invalid_rows,
                     )
-                    return await self._build_projects(cursor, list(await cursor.fetchall()))
+                    return ProjectListing(projects, len(invalid_rows))
         except Exception as error:
             raise ProjectRepositoryError("無法讀取 Guild 專案資料。") from error
 
@@ -52,43 +63,45 @@ class MySQLProjectRepository:
                 or not isinstance(deadline, date)
                 or (change_description is not None
                     and (not change_description.strip() or len(change_description.strip()) > 2000))):
-            raise ProjectRepositoryError("自訂專案欄位格式不正確。")
+            raise ProjectRepositoryError("自訂專案欄位格式不正確。", code=ErrorCode.INVALID_ARGUMENT)
         project_id = "CUS-" + uuid4().hex[:20].upper()
         change_id = "CHG-" + uuid4().hex[:20].upper()
+        committed = False
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "INSERT INTO projects (id, category, title, budget, deadline, status, owner_guild_id) "
                         "VALUES (%s, %s, %s, %s, %s, 'pending', %s)",
                         (project_id, category, title, budget, deadline, guild_id),
-                    )
-                    await cursor.executemany(
+                    ))
+                    await self.database.run(cursor.executemany(
                         "INSERT INTO project_requirements (project_id, position, content) "
                         "VALUES (%s, %s, %s)",
                         [(project_id, i, text) for i, text in enumerate(requirements)],
-                    )
-                    await cursor.executemany(
+                    ))
+                    await self.database.run(cursor.executemany(
                         "INSERT INTO project_acceptance_criteria (project_id, position, content) "
                         "VALUES (%s, %s, %s)",
                         [(project_id, i, text) for i, text in enumerate(acceptance_criteria)],
-                    )
+                    ))
                     if change_description is not None:
-                        await cursor.execute(
+                        await self.database.run(cursor.execute(
                             "INSERT INTO requirement_changes "
                             "(id, project_id, description, reason, requested_at, status) "
                             "VALUES (%s, %s, %s, %s, %s, %s)",
                             (change_id, project_id, change_description,
                              "使用者於建立專案時提供的第二輪情境", date.today(), "待評估"),
-                        )
+                        ))
+            committed = True
             project = await self.get_for_guild(guild_id, project_id)
             if project is None:
-                raise ProjectRepositoryError("自訂專案建立後無法讀取。")
+                raise ProjectRepositoryError("自訂專案建立後無法讀取。", code=ErrorCode.INVALID_STATE)
             return project
-        except ProjectRepositoryError:
-            raise
         except Exception as error:
-            raise ProjectRepositoryError("無法建立自訂專案。") from error
+            failure = ProjectRepositoryError(code=classify_error(error).code,
+                operation=project_id, write_outcome='committed' if committed else classify_error(error).write_outcome)
+            raise failure from error
 
     async def add_requirement_change(
         self, guild_id: int, project_id: str, description: str,
@@ -99,7 +112,7 @@ class MySQLProjectRepository:
         normalized_description = description.strip()
         if (guild_id <= 0 or not normalized_description
                 or len(normalized_description) > 2000):
-            raise ProjectRepositoryError("需求變更內容格式不正確。")
+            raise ProjectRepositoryError("需求變更內容格式不正確。", code=ErrorCode.INVALID_ARGUMENT)
         change_id = "CHG-" + uuid4().hex[:20].upper()
         change = RequirementChange(
             change_id, normalized_id, normalized_description,
@@ -108,67 +121,69 @@ class MySQLProjectRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT project_id FROM guild_current_projects "
                         "WHERE guild_id = %s FOR UPDATE",
                         (guild_id,),
-                    )
-                    current = await cursor.fetchone()
+                    ))
+                    current = await self.database.run(cursor.fetchone())
                     if current is None or current["project_id"] != normalized_id:
-                        raise ProjectRepositoryError("這個專案不是本伺服器目前進行中的專案。")
-                    await cursor.execute(
+                        raise ProjectRepositoryError("這個專案不是本伺服器目前進行中的專案。", code=ErrorCode.FORBIDDEN_ACTION)
+                    await self.database.run(cursor.execute(
                         "SELECT owner_guild_id, status FROM projects WHERE id = %s FOR UPDATE",
                         (normalized_id,),
-                    )
-                    row = await cursor.fetchone()
+                    ))
+                    row = await self.database.run(cursor.fetchone())
                     if (row is None or row["owner_guild_id"] != guild_id
                             or row["status"] != ProjectStatus.IN_PROGRESS.value):
-                        raise ProjectRepositoryError("只能修改本伺服器進行中的自訂專案。")
-                    await cursor.execute(
+                        raise ProjectRepositoryError("只能修改本伺服器進行中的自訂專案。", code=ErrorCode.FORBIDDEN_ACTION)
+                    await self.database.run(cursor.execute(
                         "SELECT COUNT(*) AS n FROM requirement_changes WHERE project_id = %s",
                         (normalized_id,),
-                    )
-                    if (await cursor.fetchone())["n"]:
-                        raise ProjectRepositoryError("這個專案已有第二輪需求變更。")
-                    await cursor.execute(
+                    ))
+                    if (await self.database.run(cursor.fetchone()))["n"]:
+                        raise ProjectRepositoryError("這個專案已有第二輪需求變更。", code=ErrorCode.INVALID_STATE)
+                    await self.database.run(cursor.execute(
                         "INSERT INTO requirement_changes "
                         "(id, project_id, description, reason, requested_at, status) "
                         "VALUES (%s, %s, %s, %s, %s, %s)",
                         (change.id, change.project_id, change.description,
                          change.reason, change.requested_at, change.status),
-                    )
+                    ))
             return change
         except ProjectRepositoryError:
             raise
         except Exception as error:
             raise ProjectRepositoryError("無法保存需求變更。") from error
 
+    @readonly_retry
     async def list_projects(self) -> list[Project]:
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT id, category, title, budget, deadline, status, owner_guild_id "
                         "FROM projects ORDER BY id"
-                    )
-                    projects = list(await cursor.fetchall())
+                    ))
+                    projects = list(await self.database.run(cursor.fetchall()))
                     return await self._build_projects(cursor, projects)
         except DatabaseError as error:
             raise ProjectRepositoryError("無法讀取 MySQL 專案資料。") from error
         except Exception as error:
             raise ProjectRepositoryError("無法讀取 MySQL 專案資料。") from error
 
+    @readonly_retry
     async def get_project(self, project_id: str) -> Project | None:
         normalized_id = project_id.strip().upper()
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT id, category, title, budget, deadline, status, owner_guild_id "
                         "FROM projects WHERE id = %s",
                         (normalized_id,),
-                    )
-                    row = await cursor.fetchone()
+                    ))
+                    row = await self.database.run(cursor.fetchone())
                     if row is None:
                         return None
                     return (await self._build_projects(cursor, [row]))[0]
@@ -186,15 +201,15 @@ class MySQLProjectRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "UPDATE projects SET status = %s WHERE id = %s",
                         (status.value, normalized_id),
-                    )
+                    ))
                     if cursor.rowcount == 0:
-                        raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}")
+                        raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}", code=ErrorCode.PROJECT_NOT_FOUND)
             project = await self.get_project(normalized_id)
             if project is None:
-                raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}")
+                raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}", code=ErrorCode.PROJECT_NOT_FOUND)
             return project
         except ProjectRepositoryError:
             raise
@@ -207,7 +222,7 @@ class MySQLProjectRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         """
                         INSERT INTO projects (id, category, title, budget, deadline, status)
                         VALUES (%s, %s, %s, %s, %s, %s) AS new
@@ -224,35 +239,35 @@ class MySQLProjectRepository:
                             project.deadline,
                             project.status.value,
                         ),
-                    )
+                    ))
                     for table in (
                         "project_requirements",
                         "project_acceptance_criteria",
                     ):
-                        await cursor.execute(
+                        await self.database.run(cursor.execute(
                             f"DELETE FROM {table} WHERE project_id = %s", (project.id,)
-                        )
-                    await cursor.executemany(
+                        ))
+                    await self.database.run(cursor.executemany(
                         "INSERT INTO project_requirements (project_id, position, content) "
                         "VALUES (%s, %s, %s)",
                         [
                             (project.id, position, content)
                             for position, content in enumerate(project.requirements)
                         ],
-                    )
-                    await cursor.executemany(
+                    ))
+                    await self.database.run(cursor.executemany(
                         "INSERT INTO project_acceptance_criteria (project_id, position, content) "
                         "VALUES (%s, %s, %s)",
                         [
                             (project.id, position, content)
                             for position, content in enumerate(project.acceptance_criteria)
                         ],
-                    )
-                    await cursor.execute(
+                    ))
+                    await self.database.run(cursor.execute(
                         "DELETE FROM requirement_changes WHERE project_id = %s",
                         (project.id,),
-                    )
-                    await cursor.executemany(
+                    ))
+                    await self.database.run(cursor.executemany(
                         """
                         INSERT INTO requirement_changes
                             (id, project_id, description, reason, requested_at, status)
@@ -269,7 +284,7 @@ class MySQLProjectRepository:
                             )
                             for change in project.requirement_changes
                         ],
-                    )
+                    ))
         except (DatabaseError, Exception) as error:
             raise ProjectRepositoryError("無法匯入 MySQL 專案資料。") from error
 
@@ -286,12 +301,12 @@ class MySQLProjectRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT project_id FROM guild_current_projects "
                         "WHERE guild_id = %s FOR UPDATE",
                         (guild_id,),
-                    )
-                    guild_row = await cursor.fetchone()
+                    ))
+                    guild_row = await self.database.run(cursor.fetchone())
                     current_id = (
                         str(guild_row["project_id"]) if guild_row is not None else None
                     )
@@ -300,33 +315,39 @@ class MySQLProjectRepository:
                             pass
                         else:
                             raise ProjectRepositoryError(
-                                f"專案 {normalized_id} 已經在這個伺服器進行中。"
+                                f"專案 {normalized_id} 已經在這個伺服器進行中。",
+                                code=ErrorCode.INVALID_STATE,
                             )
                     elif current_id is not None:
                         raise ProjectRepositoryError(
-                            f"這個伺服器已有進行中會議：{current_id}。"
+                            f"這個伺服器已有進行中會議：{current_id}。",
+                            code=ErrorCode.INVALID_STATE,
                         )
 
-                    await cursor.execute(
-                        "SELECT status, owner_guild_id FROM projects WHERE id = %s FOR UPDATE",
+                    await self.database.run(cursor.execute(
+                        "SELECT id, category, title, budget, deadline, status, owner_guild_id "
+                        "FROM projects WHERE id = %s FOR UPDATE",
                         (normalized_id,),
-                    )
-                    project_row = await cursor.fetchone()
+                    ))
+                    project_row = await self.database.run(cursor.fetchone())
                     if project_row is None:
-                        raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}，請先使用 /projects 查看。")
+                        raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}，請先使用 /projects 查看。", code=ErrorCode.PROJECT_NOT_FOUND)
                     if project_row["owner_guild_id"] not in (None, guild_id):
-                        raise ProjectRepositoryError("這個專案不屬於目前伺服器。")
+                        raise ProjectRepositoryError("這個專案不屬於目前伺服器。", code=ErrorCode.INVALID_STATE)
+                    # 在交易寫入狀態前驗證，避免不完整專案被占用成進行中。
+                    await self._build_projects(cursor, [project_row])
                     status = ProjectStatus.from_value(project_row["status"])
                     if current_id != normalized_id:
                         if not status.can_transition_to(ProjectStatus.IN_PROGRESS):
                             raise ProjectRepositoryError(
-                                f"專案 {normalized_id} 目前無法啟動。"
+                                f"專案 {normalized_id} 目前無法啟動。",
+                                code=ErrorCode.INVALID_STATE,
                             )
-                        await cursor.execute(
+                        await self.database.run(cursor.execute(
                             "UPDATE projects SET status = %s WHERE id = %s",
                             (ProjectStatus.IN_PROGRESS.value, normalized_id),
-                        )
-                        await cursor.execute(
+                        ))
+                        await self.database.run(cursor.execute(
                             """
                             INSERT INTO guild_current_projects (guild_id, project_id, started_at)
                             VALUES (%s, %s, UTC_TIMESTAMP(6)) AS new
@@ -335,10 +356,10 @@ class MySQLProjectRepository:
                                 started_at = new.started_at
                             """,
                             (guild_id, normalized_id),
-                        )
+                        ))
             project = await self.get_project(normalized_id)
             if project is None:
-                raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}。")
+                raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}。", code=ErrorCode.PROJECT_NOT_FOUND)
             return project
         except ProjectRepositoryError:
             raise
@@ -349,32 +370,34 @@ class MySQLProjectRepository:
         self,
         cursor: Any,
         rows: list[dict[str, object]],
+        *,
+        invalid_rows: list[str] | None = None,
     ) -> list[Project]:
         if not rows:
             return []
         identifiers = [str(row["id"]) for row in rows]
         placeholders = ", ".join(["%s"] * len(identifiers))
-        await cursor.execute(
+        await self.database.run(cursor.execute(
             "SELECT project_id, position, content FROM project_requirements "
             f"WHERE project_id IN ({placeholders}) ORDER BY project_id, position",
             identifiers,
-        )
-        requirements = _group_contents(await cursor.fetchall())
-        await cursor.execute(
+        ))
+        requirements = _group_contents(await self.database.run(cursor.fetchall()))
+        await self.database.run(cursor.execute(
             "SELECT project_id, position, content FROM project_acceptance_criteria "
             f"WHERE project_id IN ({placeholders}) ORDER BY project_id, position",
             identifiers,
-        )
-        acceptance = _group_contents(await cursor.fetchall())
-        await cursor.execute(
+        ))
+        acceptance = _group_contents(await self.database.run(cursor.fetchall()))
+        await self.database.run(cursor.execute(
             """
             SELECT id, project_id, description, reason, requested_at, status
             FROM requirement_changes
             WHERE project_id IN (""" + placeholders + ") ORDER BY project_id, requested_at, id",
             identifiers,
-        )
+        ))
         changes: dict[str, list[dict[str, object]]] = defaultdict(list)
-        for change in await cursor.fetchall():
+        for change in await self.database.run(cursor.fetchall()):
             copied = dict(change)
             copied["requested_at"] = _date_text(copied["requested_at"])
             changes[str(copied["project_id"])].append(copied)
@@ -390,7 +413,13 @@ class MySQLProjectRepository:
             try:
                 projects.append(Project.from_dict(data))
             except ProjectDataError as error:
-                raise ProjectRepositoryError("MySQL 專案資料格式不正確。") from error
+                if invalid_rows is not None:
+                    invalid_rows.append(project_id)
+                    continue
+                raise ProjectRepositoryError(
+                    "MySQL 專案資料格式不正確。", code=ErrorCode.PROJECT_DATA_INVALID,
+                    write_outcome='not_started',
+                ) from error
         return projects
 
 

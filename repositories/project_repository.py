@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+from core.errors import AppError
+
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from models.project import Project, ProjectDataError, ProjectStatus
 
 
-class ProjectRepositoryError(RuntimeError):
+class ProjectRepositoryError(AppError):
     """讀取或解析專案資料時發生的可預期錯誤。"""
+
+
+@dataclass(frozen=True)
+class ProjectListing:
+    """一次查詢的有效專案與隔離數；不使用跨指令共用的可變警告狀態。"""
+
+    projects: list[Project]
+    invalid_count: int = 0
 
 
 class ProjectRepository(Protocol):

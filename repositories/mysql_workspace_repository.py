@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from core.errors import AppError
+from core.text_quality import sentence_excerpt
+
 import json
 from typing import Any
 
-from database.db import MySQLDatabase
+from database.db import readonly_retry, MySQLDatabase
 from models.workspace import ProjectPriority, Workspace
 
 
-class WorkspaceRepositoryError(RuntimeError):
+class WorkspaceRepositoryError(AppError):
     """A workspace query or update failed."""
 
 
@@ -21,51 +24,52 @@ class MySQLWorkspaceRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "INSERT IGNORE INTO workspaces (guild_id, name, default_priority) "
                         "VALUES (%s, %s, %s)",
                         (guild_id, guild_name[:100] or "Discord 工作區", ProjectPriority.GROWTH.value),
-                    )
+                    ))
                     if not guild_name.startswith("Guild "):
-                        await cursor.execute(
+                        await self.database.run(cursor.execute(
                             "UPDATE workspaces SET name = %s WHERE guild_id = %s "
                             "AND name = %s",
                             (guild_name[:100] or "Discord 工作區", guild_id, f"Guild {guild_id}"),
-                        )
+                        ))
             return await self.get(guild_id)
         except Exception as error:
             if isinstance(error, WorkspaceRepositoryError):
                 raise
             raise WorkspaceRepositoryError("無法建立工作區。") from error
 
+    @readonly_retry
     async def get(self, guild_id: int) -> Workspace:
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT name, default_priority FROM workspaces WHERE guild_id = %s",
                         (guild_id,),
-                    )
-                    row = await cursor.fetchone()
+                    ))
+                    row = await self.database.run(cursor.fetchone())
                     if row is None:
                         raise WorkspaceRepositoryError("找不到工作區。")
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT project_id FROM guild_current_projects WHERE guild_id = %s",
                         (guild_id,),
-                    )
-                    current = await cursor.fetchone()
-                    await cursor.execute(
+                    ))
+                    current = await self.database.run(cursor.fetchone())
+                    await self.database.run(cursor.execute(
                         "SELECT COUNT(*) AS n FROM projects WHERE owner_guild_id = %s "
                         "AND status = 'completed'",
                         (guild_id,),
-                    )
-                    completed = await cursor.fetchone()
-                    await cursor.execute(
+                    ))
+                    completed = await self.database.run(cursor.fetchone())
+                    await self.database.run(cursor.execute(
                         "SELECT COUNT(DISTINCT project_id) AS n FROM meetings "
                         "WHERE guild_id = %s AND final_proposal IS NOT NULL",
                         (guild_id,),
-                    )
-                    finalized = await cursor.fetchone()
+                    ))
+                    finalized = await self.database.run(cursor.fetchone())
                     return Workspace(
                         guild_id=guild_id,
                         name=str(row["name"]),
@@ -83,10 +87,10 @@ class MySQLWorkspaceRepository:
         try:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "UPDATE workspaces SET default_priority = %s WHERE guild_id = %s",
                         (priority.value, guild_id),
-                    )
+                    ))
                     if cursor.rowcount == 0:
                         raise WorkspaceRepositoryError("找不到工作區。")
             return await self.get(guild_id)
@@ -95,11 +99,12 @@ class MySQLWorkspaceRepository:
         except Exception as error:
             raise WorkspaceRepositoryError("無法更新優先目標。") from error
 
+    @readonly_retry
     async def recent_experiences(self, guild_id: int, project_id: str, *, exclude_meeting_id: str | None = None) -> list[dict[str, str]]:
         try:
             async with self.database.connection() as connection:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(
+                    await self.database.run(cursor.execute(
                         "SELECT m.id, m.project_id, m.final_proposal FROM meetings m "
                         "JOIN projects p ON p.id = m.project_id "
                         "WHERE m.guild_id = %s "
@@ -107,9 +112,9 @@ class MySQLWorkspaceRepository:
                         "AND m.final_proposal IS NOT NULL AND (%s IS NULL OR m.id <> %s) "
                         "ORDER BY m.updated_at DESC, m.id DESC LIMIT 3",
                         (guild_id, project_id, exclude_meeting_id, exclude_meeting_id),
-                    )
+                    ))
                     result: list[dict[str, str]] = []
-                    for row in await cursor.fetchall():
+                    for row in await self.database.run(cursor.fetchall()):
                         proposal: Any = row["final_proposal"]
                         if isinstance(proposal, str):
                             proposal = json.loads(proposal)
@@ -124,8 +129,8 @@ class MySQLWorkspaceRepository:
                             "meeting_id": str(row["id"]),
                             "project_id": str(row["project_id"]),
                             "title": str(proposal.get("title", ""))[:80],
-                            "summary": str(proposal.get("summary", ""))[:180],
-                            "tradeoffs": tradeoffs[:150],
+                            "summary": sentence_excerpt(str(proposal.get("summary", "")), 180),
+                            "tradeoffs": sentence_excerpt(tradeoffs, 150),
                         })
                     return result
         except Exception as error:

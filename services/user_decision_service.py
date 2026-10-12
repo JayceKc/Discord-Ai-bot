@@ -1,5 +1,8 @@
 """保存使用者決策、候選方案與批准流程；所有入口共用授權。"""
 from __future__ import annotations
+from core.errors import ErrorCode, ErrorContext, classify_error
+
+from services.workflow_events import reports_progress, emit_progress
 
 import asyncio
 import copy
@@ -13,6 +16,7 @@ from models.meeting import MeetingRecord, ProposalMetrics
 from models.user_decision import DecisionQuestion
 from services.quality_evaluator import evaluate_review
 from services.meeting_manager import MeetingManagerError
+from agents.errors import RetryableAgentError
 
 
 def now() -> str:
@@ -23,34 +27,69 @@ def proposal_digest(proposal: dict) -> str:
     return hashlib.sha256(json.dumps(proposal, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
+def _sum_tokens(first: int | None, second: int | None) -> int | None:
+    return first + second if first is not None and second is not None else None
+
+
 class UserDecisionService:
     """使用 MeetingManager 的 Guild lock，資料保存另有持久版本檢查。"""
 
     def __init__(self, manager):
         self.manager = manager
 
+    async def _retry_pm(self, method_name, prompt, record, *, agent_name, stage, validate=None):
+        """把局部驗證提示帶入下一次有限重試，且不污染其他 Guild。"""
+        feedback = None
+        invalid_response = None
+        incomplete_fields = None
+
+        async def operation():
+            nonlocal feedback, invalid_response, incomplete_fields
+            agent = self.manager._pm_agent
+            repair = getattr(agent, method_name + "_with_validation_feedback", None)
+            try:
+                field_repair = getattr(agent, "repair_decision_fields", None)
+                if method_name == "apply_decision" and invalid_response is not None and callable(field_repair):
+                    response = await field_repair(prompt, invalid_response, incomplete_fields)
+                elif feedback and callable(repair):
+                    response = await repair(prompt, feedback)
+                else:
+                    response = await getattr(agent, method_name)(prompt)
+                if validate is not None:
+                    validate(response)
+                return response
+            except RetryableAgentError as error:
+                feedback = getattr(error, "validation_feedback", None)
+                invalid_response = getattr(error, "invalid_response", None)
+                incomplete_fields = getattr(error, "incomplete_fields", None)
+                raise
+
+        return await self.manager._retry_operation(operation,
+            meeting_id=record.meeting_id, agent_name=agent_name, stage=stage)
+
     async def get(self, guild_id: int) -> MeetingRecord:
         record = await self.manager._get_for_guild(guild_id)
         if record is None or record.decision_status == "legacy":
-            raise MeetingManagerError("目前沒有新版使用者決策會議，請由 /meeting 或 /start 啟動新會議。")
+            raise MeetingManagerError("目前沒有新版使用者決策會議，請由 /meeting 或 /start 啟動新會議。", code=ErrorCode.INVALID_STATE)
         return record
 
     @staticmethod
     def authorize(record, guild_id, user_id, *, meeting_id=None, version=None, message_id=None):
         if guild_id is None or record.guild_id != guild_id:
-            raise MeetingManagerError("此決策只能在原 Discord 伺服器操作。")
+            raise MeetingManagerError("此決策只能在原 Discord 伺服器操作。", code=ErrorCode.FORBIDDEN_ACTION)
         if record.decision_owner_user_id != user_id:
-            raise MeetingManagerError("只有啟動這場會議的使用者可以決策。")
+            raise MeetingManagerError("只有啟動這場會議的使用者可以決策。", code=ErrorCode.FORBIDDEN_ACTION)
         if meeting_id is not None and record.meeting_id != meeting_id:
-            raise MeetingManagerError("這是舊會議的按鈕，請使用目前會議的訊息。")
+            raise MeetingManagerError("這是舊會議的按鈕，請使用目前會議的訊息。", code=ErrorCode.STALE_DECISION)
         if version is not None and record.decision_version != version:
-            raise MeetingManagerError("此按鈕已過期，請使用最新訊息或 /decide。")
+            raise MeetingManagerError("此按鈕已過期，請使用最新訊息或 /decide。", code=ErrorCode.STALE_DECISION)
         if message_id is not None and not any(
             m["message_id"] == message_id and m["version"] == record.decision_version
             and m["status"] == record.decision_status for m in record.decision_messages
         ):
-            raise MeetingManagerError("此訊息不是目前有效的決策訊息，請使用 /decide。")
+            raise MeetingManagerError("此訊息不是目前有效的決策訊息，請使用 /decide。", code=ErrorCode.STALE_DECISION)
 
+    @reports_progress
     async def prepare(self, record):
         """呼叫端已取得 Guild lock。生成後保存，重顯示不再呼叫模型。"""
         m = self.manager
@@ -83,21 +122,23 @@ class UserDecisionService:
                 item["output"] = item["output"][:count]
             prompt = json.dumps(context, ensure_ascii=False)
         prompt = m._validate_prompt_budget(prompt)
+        await emit_progress(record, "decision_preparation", agent_name="PM Agent")
         response = await m._retry_operation(lambda: m._pm_agent.create_decision(prompt),
             meeting_id=record.meeting_id, agent_name="PM Decision Agent", stage="user_decision")
         question = DecisionQuestion.model_validate(response.model_dump(mode="json"))
         for source in question.sources:
             if source.step_index >= len(record.steps):
-                raise MeetingManagerError("決策分歧引用不存在的 Agent 步驟。")
+                raise MeetingManagerError("決策分歧引用不存在的 Agent 步驟。", code=ErrorCode.LLM_INVALID_OUTPUT)
             step = record.steps[source.step_index]
             if step.round_number not in {1, 2} or not step.output_data or not any(
                 source.quote in value for value in self._strings(step.output_data)
             ):
-                raise MeetingManagerError("決策分歧必須逐字引用已保存的討論內容，請重試 /review。")
+                raise MeetingManagerError("決策分歧必須逐字引用已保存的討論內容，請重試 /review。", code=ErrorCode.LLM_INVALID_OUTPUT)
         record.user_decision = {"question": question.model_dump(mode="json"), "history": [], "selection": None}
         record.decision_status = "awaiting_choice"
         record.decision_version += 1
         await m._save(record)
+        await emit_progress(record, "awaiting_choice", "waiting")
         return record
 
     @staticmethod
@@ -123,11 +164,12 @@ class UserDecisionService:
             for item in value:
                 yield from UserDecisionService._strings(item)
 
+    @reports_progress
     async def act(self, guild_id, user_id, choice, *, meeting_id=None, version=None, message_id=None):
         m = self.manager
         lock = m._guild_locks.setdefault(guild_id, asyncio.Lock())
         if lock.locked():
-            raise MeetingManagerError("目前正在處理這場會議，請稍後重試。")
+            raise MeetingManagerError("目前正在處理這場會議，請稍後重試。", code=ErrorCode.WORKFLOW_BUSY)
         async with lock:
             record = await self.get(guild_id)
             self.authorize(record, guild_id, user_id, meeting_id=meeting_id, version=version, message_id=message_id)
@@ -135,20 +177,20 @@ class UserDecisionService:
             if record.decision_status == "awaiting_approval":
                 return await self._approval(record, user_id, choice)
             if record.decision_status not in {"awaiting_choice", "applying_choice"}:
-                raise MeetingManagerError("目前沒有等待選擇的決策，請使用 /review 查看狀態。")
+                raise MeetingManagerError("目前沒有等待選擇的決策，請使用 /review 查看狀態。", code=ErrorCode.INVALID_STATE)
             data = record.user_decision
             question = DecisionQuestion.model_validate(data["question"])
             option = next((o for o in question.options if o.option_id == choice), None)
             if option is None:
-                raise MeetingManagerError("請選擇目前畫面中的 A、B 或 C 選項。")
+                raise MeetingManagerError("請選擇目前畫面中的 A、B 或 C 選項。", code=ErrorCode.INVALID_ARGUMENT)
             if record.decision_status == "applying_choice":
                 if data["selection"]["option_id"] != choice:
-                    raise MeetingManagerError("已有保存的選擇，請用相同選項重試完成處理。")
+                    raise MeetingManagerError("已有保存的選擇，請用相同選項重試完成處理。", code=ErrorCode.INVALID_STATE)
                 if data.get("lease_until", 0) > time.time():
-                    raise MeetingManagerError("此選擇正在處理；若 Bot 中斷，15 分鐘後可重試。")
+                    raise MeetingManagerError("此選擇正在處理；若 Bot 中斷，15 分鐘後可重試。", code=ErrorCode.WORKFLOW_BUSY)
             else:
                 if data["history"] and data["history"][-1].get("outcome") == "rejected" and data["history"][-1]["selection"]["option_id"] == choice:
-                    raise MeetingManagerError("此方向已駁回，請選擇另一個選項。")
+                    raise MeetingManagerError("此方向已駁回，請選擇另一個選項。", code=ErrorCode.INVALID_ARGUMENT)
                 data["selection"] = {"option_id": choice, "user_id": user_id, "selected_at": now()}
                 data["impact"] = []
                 record.decision_status = "applying_choice"
@@ -157,21 +199,34 @@ class UserDecisionService:
             data["operation_id"] = str(uuid4())
             record.error = None
             await m._save(record)
+            await emit_progress(record, "applying_choice", agent_name="PM Agent")
             try:
                 await self._apply(record, option)
             except Exception as error:
                 # CAS 保護：較舊操作不能清除新操作的 lease 或覆寫結果。
-                record.error = "套用選擇或評分中斷；請使用 /decide 選擇相同選項重試。"
+                report = classify_error(error, ErrorContext(guild_id=guild_id, write_outcome='unknown'))
+                if report.code.value.startswith('DB_'):
+                    raise MeetingManagerError(code=report.code, write_outcome=report.write_outcome) from error
+                record.error = f"{report.code.value}｜{report.reference_id}｜{report.user_message}"
                 data["lease_until"] = 0
-                await m._save(record)
+                try:
+                    await m._save(record)
+                except Exception as save_error:
+                    from core.logging_security import log_error
+                    context = ErrorContext(guild_id=guild_id, write_outcome='unknown')
+                    log_error(report, context, error)
+                    raise MeetingManagerError(code=classify_error(save_error, context).code) from save_error
                 if isinstance(error, MeetingManagerError):
+                    error.reference_id = report.reference_id
+                    error.write_outcome = "committed"
                     raise
-                raise MeetingManagerError(record.error) from error
+                raise MeetingManagerError(record.error, code=report.code, reference_id=report.reference_id, write_outcome="committed") from error
             record.decision_status = "awaiting_approval"
             record.decision_version += 1
             record.candidate_review["decision_version"] = record.decision_version
             data["lease_until"] = 0
             await m._save(record)
+            await emit_progress(record, "awaiting_approval", "waiting")
             return record
 
     async def _apply(self, record, option):
@@ -196,11 +251,13 @@ class UserDecisionService:
             await self._review(record, option)
 
     async def _integrate(self, record, option, *, revision=False):
+        await emit_progress(record, "revision" if revision else "applying_choice", agent_name="PM Agent")
         m = self.manager
         context = {
             "project_id": record.project_id, "requirement": record.requirement,
             "requirement_change": record.applied_requirement_change.to_dict() if record.applied_requirement_change else None,
             "original_proposal": record.proposal_draft,
+            "allowed_sources": m._source_catalogue(record),
             "user_choice": option.model_dump(mode="json"),
             "question": record.user_decision["question"]["topic"],
             **m._priority_context(record),
@@ -210,28 +267,86 @@ class UserDecisionService:
                 review_issues=record.candidate_review["issues"], revision_output=record.revision_output)
         prompt = m._validate_prompt_budget(json.dumps(context, ensure_ascii=False))
         started = time.perf_counter()
-        response = await m._retry_operation(lambda: m._pm_agent.apply_decision(prompt),
-            meeting_id=record.meeting_id, agent_name="PM Choice Agent", stage="apply_choice")
+        def apply_checked(response):
+            from services.proposal_quality import checked_sources
+            checked_sources(response.output.proposal.model_dump(mode="json"), m._source_catalogue(record))
+
+        response = await self._retry_pm("apply_decision", prompt, record,
+            agent_name="PM Choice Agent", stage="apply_choice", validate=apply_checked)
         output = response.output
         proposal = output.proposal.model_dump(mode="json")
+        from services.proposal_quality import checked_sources
+        proposal = checked_sources(proposal, m._source_catalogue(record))
         if output.option_id != option.option_id:
-            raise MeetingManagerError("PM 套用的選項與使用者選擇不一致。")
-        if len(json.dumps(proposal, ensure_ascii=False)) > m.max_response_characters:
-            raise MeetingManagerError("PM 候選方案超過字元預算。")
-        impacts = []
-        for impact in output.decision_impact:
-            before = record.proposal_draft["sections"][impact.section]
-            after = proposal["sections"][impact.section]
-            if impact.section not in option.expected_changes or before.strip() == after.strip():
-                raise MeetingManagerError("選擇必須實際改變選項指定的方案章節。")
-            impacts.append({"section": impact.section, "before": before, "after": after, "reason": impact.reason})
-        if not impacts:
-            raise MeetingManagerError("候選方案沒有實際決策影響。")
+            raise MeetingManagerError("PM 套用的選項與使用者選擇不一致。", code=ErrorCode.LLM_INVALID_OUTPUT)
+        # 第一次套用選擇時與原始草案比較；Review 後重整時，
+        # 必須與上一版候選方案比較，否則第二次修改可能被錯誤判定為沒有變化。
+        baseline = record.candidate_proposal if revision and record.candidate_proposal else record.proposal_draft
+        baseline_sections = baseline["sections"]
+        proposal_sections = proposal["sections"]
+
+        # 以程式實際比較 expected_changes 章節，避免模型雖然填了
+        # decision_impact，卻沒有真的修改使用者選擇指定的內容。
+        unchanged_sections = [
+            section for section in option.expected_changes
+            if baseline_sections[section].strip() == proposal_sections[section].strip()
+        ]
+        input_characters = len(prompt)
+        prompt_tokens = response.usage.prompt_tokens
+        completion_tokens = response.usage.completion_tokens
+        max_output_tokens = response.max_output_tokens
+        for section in unchanged_sections:
+            rewrite_prompt = m._validate_prompt_budget(json.dumps({
+                "requirement": record.requirement,
+                "requirement_change": (
+                    record.applied_requirement_change.to_dict()
+                    if record.applied_requirement_change else None
+                ),
+                "choice": option.model_dump(mode="json"),
+                "section": section,
+                "current_text": baseline_sections[section],
+                "whole_proposal": proposal,
+                "consistency_rule": "改寫必須符合 summary 與 decisions 的已選方向；保留硬性驗收，不能把拒絕的方案重新寫回。",
+                "review_issues": record.candidate_review.get("issues", []) if revision else [],
+            }, ensure_ascii=False))
+            rewritten = await self._retry_pm(
+                "rewrite_decision_section", rewrite_prompt, record,
+                agent_name="PM Choice Section Agent",
+                stage="apply_choice_section",
+            )
+            proposal_sections[section] = rewritten.output.rewritten_text
+            input_characters += len(rewrite_prompt)
+            prompt_tokens = _sum_tokens(prompt_tokens, rewritten.usage.prompt_tokens)
+            completion_tokens = _sum_tokens(completion_tokens, rewritten.usage.completion_tokens)
+            max_output_tokens = _sum_tokens(max_output_tokens, rewritten.max_output_tokens)
+
+        changed_sections = [
+            section for section in option.expected_changes
+            if baseline_sections[section].strip() != proposal_sections[section].strip()
+        ]
+        if len(changed_sections) != len(option.expected_changes):
+            raise MeetingManagerError("選擇必須實際改變選項指定的方案章節。", code=ErrorCode.LLM_INVALID_OUTPUT)
+        proposal_text = json.dumps(proposal, ensure_ascii=False)
+        if len(proposal_text) > m.max_response_characters:
+            raise MeetingManagerError("PM 候選方案超過字元預算。", code=ErrorCode.LLM_INVALID_OUTPUT)
+
+        # 保留模型提供的修改理由；若模型漏列某個實際變更章節，
+        # 使用安全的預設理由，避免 Qwen 格式小偏差造成整個流程失敗。
+        model_impacts = {impact.section: impact.reason for impact in output.decision_impact}
+        impacts = [
+            {
+                "section": section,
+                "before": baseline_sections[section],
+                "after": proposal_sections[section],
+                "reason": model_impacts.get(section, "依照使用者選擇調整方案章節。"),
+            }
+            for section in changed_sections
+        ]
         record.candidate_proposal = proposal
         record.candidate_proposal_metrics = ProposalMetrics(
-            input_characters=len(prompt), output_characters=len(json.dumps(proposal, ensure_ascii=False)),
-            prompt_tokens=response.usage.prompt_tokens, completion_tokens=response.usage.completion_tokens,
-            max_output_tokens=response.max_output_tokens, execution_time_seconds=round(time.perf_counter()-started, 3))
+            input_characters=input_characters, output_characters=len(proposal_text),
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            max_output_tokens=max_output_tokens, execution_time_seconds=round(time.perf_counter()-started, 3))
         record.user_decision["impact"] = impacts
         if revision:
             record.user_decision["revision_pending"] = False
@@ -251,10 +366,10 @@ class UserDecisionService:
 
     async def _approval(self, record, user_id, choice):
         if choice not in {"APPROVE", "REJECT"}:
-            raise MeetingManagerError("方案等待確認，請選擇 approve（批准）或 reject（駁回）。")
+            raise MeetingManagerError("方案等待確認，請選擇 approve（批准）或 reject（駁回）。", code=ErrorCode.INVALID_ARGUMENT)
         data = record.user_decision
         if not record.candidate_proposal or not record.candidate_review or record.candidate_review.get("decision_version") != record.decision_version or record.candidate_review.get("proposal_digest") != proposal_digest(record.candidate_proposal):
-            raise MeetingManagerError("目前方案尚無對應評分，不能批准或駁回。")
+            raise MeetingManagerError("目前方案尚無對應評分，不能批准或駁回。", code=ErrorCode.INVALID_STATE)
         snapshot = {"selection": copy.deepcopy(data["selection"]), "impact": copy.deepcopy(data["impact"]),
             "proposal": copy.deepcopy(record.candidate_proposal), "review": copy.deepcopy(record.candidate_review),
             "evaluations": copy.deepcopy(data.get("evaluations", [])),
@@ -275,6 +390,7 @@ class UserDecisionService:
             record.decision_status = "awaiting_choice"
         record.decision_version += 1
         await self.manager._save(record)
+        await emit_progress(record, record.decision_status, "completed" if choice == "APPROVE" else "waiting")
         return record
 
     async def remember_message(self, guild_id, meeting_id, version, status, channel_id, message_id):

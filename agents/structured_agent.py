@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -14,6 +14,8 @@ from agents.base_agent import (
     BaseAgent,
 )
 from agents.errors import RetryableAgentError
+from core.errors import ErrorCode
+from core.text_quality import incomplete_paths
 from services.llm_service import LLMUsage
 
 
@@ -55,6 +57,13 @@ class StructuredAgent(Generic[OutputModel]):
         response = await self.respond_with_metadata(user_input)
         return response.output
 
+    async def respond_with_validation_feedback(self, user_input: str, validation_feedback: str):
+        """既有有限重試的局部修正提示，不修改跨 Guild 共用設定。"""
+        config = replace(self.config, system_prompt=self.config.system_prompt
+            + "\n上次驗證失敗：" + validation_feedback[:500]
+            + "\n請縮短表達並完整收尾，不增加無根據內容。")
+        return await StructuredAgent(config, self.llm_service, self.output_model).respond_with_metadata(user_input)
+
     async def respond_with_metadata(
         self,
         user_input: str,
@@ -69,8 +78,18 @@ class StructuredAgent(Generic[OutputModel]):
             raise AgentSchemaValidationError(
                 f"{self.config.name} 回覆格式不正確，請重新產生。"
             ) from error
+        findings = incomplete_paths(output.model_dump(mode="json"))
+        if findings:
+            error = AgentSchemaValidationError("模型文字未完整收尾，請用完整短句重新產生。")
+            error.validation_feedback = "未收尾欄位：" + "、".join(findings[:5])
+            # 僅供本次有限重試使用，不放到共用 Agent 上或保存為成功輸出。
+            error.invalid_response = StructuredAgentResponse(output, response.usage, self.config.max_output_tokens)
+            error.incomplete_fields = findings
+            raise error
         return StructuredAgentResponse(
             output=output,
             usage=response.usage,
             max_output_tokens=self.config.max_output_tokens,
         )
+
+AgentSchemaValidationError.default_code = ErrorCode.LLM_INVALID_OUTPUT

@@ -52,6 +52,7 @@ class CreativeAgent(StructuredAgent[CreativeAnalysis]):
             # Creative 使用較高溫度與不同 Seed，增加方案的變化性。
             temperature=0.8,
             seed=7,
+            timeout_seconds=180.0,
             max_output_tokens=1000,
             json_schema=CreativeAnalysis.model_json_schema(),
         )

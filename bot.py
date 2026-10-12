@@ -6,6 +6,8 @@ import logging  # 記錄 Bot 上線、指令執行與錯誤狀態。
 import json  # 將 Agent 的結構化輸出整理成 Discord 可讀文字。
 import time  # 顯示 Agent 與 PM 整合草案的實際處理時間。
 import inspect
+import asyncio
+import sys
 from typing import Protocol  # 定義 Bot 需要的 LLM 服務介面。
 
 import discord  # Discord API 的主要型別與 Embed 功能。
@@ -23,9 +25,15 @@ from agents import (
     ReviewAgent,
 )
 from agents.project_intent_agent import ProjectIntent
-from config import Settings, configure_logging, load_settings  # 載入集中管理的程式設定。
-from database.db import MySQLDatabase
+from config import Settings, load_settings  # 載入集中管理的程式設定。
+from database.db import MySQLDatabase, DatabaseError
+from core.errors import AppError, ErrorCode, ErrorContext, classify_error, safe_error_text
+from core.error_handler import ErrorHandler
+from core.logging_security import configure_safe_logging, register_secrets, log_error
+from presentation.discord_delivery import (safe_defer, safe_followup_send, safe_channel_send, safe_message_edit, safe_original_response_edit, DELIVERY_ERRORS)
+from services.project_submission_service import ProjectSubmissionService
 from models.meeting import MeetingRecord, MeetingStepRecord, ProposalMetrics
+from presentation.message_chunks import split_discord_message as split_message_chunks
 from models.project import Project, RequirementChange
 from models.workspace import ProjectPriority
 from repositories.mysql_guild_project_store import MySQLGuildProjectStore
@@ -35,8 +43,10 @@ from repositories.mysql_workspace_repository import MySQLWorkspaceRepository, Wo
 from repositories.project_repository import (
     ProjectRepository,
     ProjectRepositoryError,
+    ProjectListing,
 )
 from services.llm_service import LLMResponse, LLMService, LLMServiceError  # 載入 Ollama 服務。
+from services.workflow_events import WorkflowProgressCallback
 from services.meeting_manager import (
     FullMeetingResult,
     MeetingManager,
@@ -50,6 +60,10 @@ from services.project_meeting_service import (
 )
 from services.project_intake import ProjectIntake, QUESTIONS
 from views.decision_view import DecisionPresenter
+from presentation.channel_router import ChannelRouter
+from presentation.progress import ProgressPresenter, build_status_embeds, build_intake_status_embeds
+from presentation.embeds import (build_project_embeds, build_discussion_embeds,
+    build_proposal_embeds, build_review_embeds)
 
 
 logger = logging.getLogger(__name__)  # 使用模組名稱建立日誌，不記錄 Discord Token。
@@ -83,6 +97,7 @@ class DiscussionManager(Protocol):
         *,
         on_step: MeetingStepCallback | None = None,
         decision_owner_user_id: int | None = None,
+        on_progress: WorkflowProgressCallback | None = None,
     ) -> MeetingRecord:
         """執行第一輪並在每位 Agent 完成時回報。"""
 
@@ -92,21 +107,23 @@ class DiscussionManager(Protocol):
         requirement_change: RequirementChange,
         *,
         on_step: MeetingStepCallback | None = None,
+        on_progress: WorkflowProgressCallback | None = None,
     ) -> MeetingRecord:
         """套用一次需求變更並執行第二輪。"""
 
     async def create_proposal_draft(
         self, guild_id: int, *, allow_first_round_only: bool = True,
+        on_progress: WorkflowProgressCallback | None = None,
     ) -> dict[str, object]:
         """建立或讀取 PM 整合草案。"""
 
-    async def resume(self, guild_id: int) -> MeetingRecord:
+    async def resume(self, guild_id: int, *, on_progress: WorkflowProgressCallback | None = None) -> MeetingRecord:
         """恢復模型失敗後的會議步驟。"""
 
     async def get_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
         """取得已保存的 PM 草案使用量統計。"""
 
-    async def review_and_finalize(self, guild_id: int) -> ReviewWorkflowResult:
+    async def review_and_finalize(self, guild_id: int, *, on_progress: WorkflowProgressCallback | None = None) -> ReviewWorkflowResult:
         """審查草案、執行至多一次修改並產生最終方案。"""
 
     async def run_full_meeting(
@@ -118,6 +135,7 @@ class DiscussionManager(Protocol):
         *,
         on_step: MeetingStepCallback | None = None,
         decision_owner_user_id: int | None = None,
+        on_progress: WorkflowProgressCallback | None = None,
     ) -> FullMeetingResult:
         """從兩輪討論一路執行到最終方案。"""
 
@@ -135,22 +153,68 @@ class ProjectIntentClassifier(Protocol):
 class MyBot(commands.Bot):
     """啟動前會同步斜線指令的 Discord Bot。"""
 
-    def __init__(self, *args: object, database: MySQLDatabase | None = None, **kwargs: object) -> None:
+    def __init__(self, *args: object, database: MySQLDatabase | None = None,
+                 sync_guild_id: int = 0, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.database = database
+        self.sync_guild_id = sync_guild_id
+        self._restore_task = None
+        self.error_handler = ErrorHandler()
 
     async def setup_hook(self) -> None:  # Discord 登入前會自動執行一次。
+        try:
+            await self._restore_data_services()
+        except Exception as error:
+            report = await self.error_handler.handle(error)
+            if report.code != ErrorCode.DB_BAD_CONFIG:
+                self._restore_task = asyncio.create_task(self._restore_when_ready())
+        try:
+            synced_commands = await asyncio.wait_for(self.tree.sync(), 30)
+            if self.sync_guild_id:
+                guild = discord.Object(id=self.sync_guild_id)
+                self.tree.clear_commands(guild=guild)
+                await asyncio.wait_for(self.tree.sync(guild=guild), 30)
+            logger.info("已同步 %s 個斜線指令", len(synced_commands))
+        except DELIVERY_ERRORS as error:
+            # Sync failure need not terminate login; prefix commands and any
+            # previously registered slash commands can still serve the guild.
+            await self.error_handler.handle(error, ErrorContext(command='delivery', write_outcome='not_started'))
+
+    async def _restore_data_services(self):
         if self.database is not None:
             await self.database.open()
-        if getattr(self, "restore_decisions", None) is not None:
+        if getattr(self, 'restore_decisions', None) is not None:
             await self.restore_decisions()
-        synced_commands = await self.tree.sync()  # 把 /help 同步到 Discord。
-        logger.info("已同步 %s 個斜線指令", len(synced_commands))
+
+    async def _restore_when_ready(self):
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await self._restore_data_services()
+                return
+            except Exception as error:
+                report = await self.error_handler.handle(error)
+                if report.code == ErrorCode.DB_BAD_CONFIG:
+                    return
+
+    async def on_error(self, event_method, *args, **kwargs):
+        error = sys.exc_info()[1]
+        if error is not None:
+            await self.error_handler.handle(error)
 
     async def close(self) -> None:
-        if self.database is not None:
-            await self.database.close()
-        await super().close()
+        if self._restore_task is not None:
+            self._restore_task.cancel()
+            try:
+                await self._restore_task
+            except asyncio.CancelledError:
+                pass
+            self._restore_task = None
+        try:
+            if self.database is not None:
+                await self.database.close()
+        finally:
+            await super().close()
 
 
 async def resolve_repository_result(value: object) -> object:
@@ -170,66 +234,11 @@ def truncate_answer(answer: str, max_length: int) -> str:
     return answer[:content_length] + TRUNCATION_SUFFIX  # 取前段回答再接上提示。
 
 
-async def safe_followup_send(
-    interaction: discord.Interaction,
-    *args: object,
-    ephemeral: bool = False,
-    **kwargs: object,
-) -> bool:
-    """傳送公開 Followup；失敗時不影響會議工作流程與已保存資料。"""
-
-    for attempt in range(1, 3):
-        try:
-            await interaction.followup.send(*args, ephemeral=ephemeral, **kwargs)
-            return True
-        except discord.HTTPException as error:
-            logger.warning(
-                "Discord Followup 傳送失敗 guild_id=%s attempt=%s error_type=%s",
-                interaction.guild_id,
-                attempt,
-                type(error).__name__,
-            )
-
-    # 私密訊息不能降級為頻道公開訊息，避免資料意外曝光。
-    if ephemeral:
-        return False
-    channel = getattr(interaction, "channel", None)
-    send = getattr(channel, "send", None)
-    if not callable(send):
-        logger.warning("Discord Followup 失敗且無可用頻道 fallback guild_id=%s", interaction.guild_id)
-        return False
-    try:
-        await send(*args, **kwargs)
-        logger.info("Discord Followup 改由頻道傳送 guild_id=%s", interaction.guild_id)
-        return True
-    except discord.HTTPException as error:
-        logger.warning(
-            "Discord 頻道 fallback 傳送失敗 guild_id=%s error_type=%s",
-            interaction.guild_id,
-            type(error).__name__,
-        )
-        return False
-
 
 def split_discord_message(content: str, max_length: int) -> list[str]:
     """將完整內容切成多段，優先在換行處分割且不遺失文字。"""
 
-    if max_length <= 0:
-        raise ValueError("Discord 訊息長度必須大於 0。")
-
-    remaining = content
-    chunks: list[str] = []
-    while len(remaining) > max_length:
-        split_at = remaining.rfind("\n", 0, max_length + 1)
-        if split_at <= 0:
-            split_at = max_length
-        chunks.append(remaining[:split_at])
-        remaining = remaining[split_at:]
-        if remaining.startswith("\n"):
-            remaining = remaining[1:]
-    if remaining or not chunks:
-        chunks.append(remaining)
-    return chunks
+    return split_message_chunks(content, max_length)
 
 
 def format_discussion_messages(
@@ -526,16 +535,105 @@ def create_bot(
     database: MySQLDatabase | None = None,
     workspace_repository: MySQLWorkspaceRepository | None = None,
     intent_classifier: ProjectIntentClassifier | None = None,
+    status_store=None,
 ) -> MyBot:
     """使用外部傳入的設定與服務建立 Bot，方便正式執行和測試。"""
 
     intents = discord.Intents.default()  # 建立 Discord 預設事件權限。
     intents.message_content = True  # !hello 與 !ask 都需要讀取訊息內容。
-    bot = MyBot(command_prefix="!", intents=intents, database=database)  # 指定文字指令使用 ! 開頭。
+    bot = MyBot(command_prefix="!", intents=intents, database=database,
+        sync_guild_id=settings.discord_guild_id,
+        allowed_mentions=discord.AllowedMentions.none())  # 指定文字指令使用 ! 開頭。
     intake = ProjectIntake()
+    bot.project_intake = intake
     project_intent_classifier = intent_classifier or ProjectIntentAgent(llm_service)
     decision_service = getattr(discussion_manager, "decision_service", None)
-    presenter = DecisionPresenter(bot, decision_service, format_proposal_embed, format_review_embed) if decision_service is not None else None
+    router = ChannelRouter(bot, settings, status_store)
+    active_progress = {}
+    published_proposal_metrics = {}
+
+    async def latest_record(guild_id, *, strict=False):
+        getter = getattr(discussion_manager, "_get_for_guild", None)
+        if not callable(getter):
+            return None
+        try:
+            record = await resolve_repository_result(getter(guild_id))
+            return record if isinstance(record, MeetingRecord) else None
+        except Exception as error:
+            logger.warning("無法查詢狀態 guild_id=%s error_type=%s", guild_id, type(error).__name__)
+            if strict:
+                raise MeetingManagerError("暫時無法讀取會議狀態，請稍後重試。") from error
+            return None
+
+    async def run_workflow(method, *args, channel=None, **kwargs):
+        guild_id = args[0]
+        if isinstance(guild_id, MeetingRecord):
+            guild_id = guild_id.guild_id
+        progress = ProgressPresenter(router, guild_id, channel)
+        # Preserve small test/adaptor protocols that do not expose progress.
+        if "on_progress" in inspect.signature(method).parameters:
+            async def update(event):
+                active_progress[guild_id] = (progress, event)
+                await progress.update(event)
+                if event.state in {"retrying", "failed"}:
+                    await router.send(guild_id, "dev_log", channel,
+                        content=f"會議 {event.meeting_id}｜階段 {event.stage}｜{event.state}｜嘗試 {event.attempt}")
+            kwargs["on_progress"] = update
+        try:
+            return await method(*args, **kwargs)
+        finally:
+            try:
+                record = await latest_record(guild_id) if progress.latest is not None else None
+                await progress.finish(record)
+                if record is not None:
+                    metrics = record.candidate_proposal_metrics or record.final_proposal_metrics or record.proposal_metrics
+                    signature = repr(metrics)
+                    published = published_proposal_metrics.get(record.meeting_id)
+                    if published is None and status_store is not None:
+                        published = status_store.metric_signature(guild_id, record.meeting_id)
+                    if metrics is not None and published != signature:
+                        # 使用量不是憑證；避免「Token 值」被安全遮罩誤認為登入 Token。
+                        sent = await router.send(guild_id, "dev_log", channel, content=f"專案 {record.project_id}｜會議 {record.meeting_id}｜PM 整合耗時 {metrics.execution_time_seconds} 秒｜輸入／輸出字元 {metrics.input_characters}／{metrics.output_characters}｜推論用量（輸入／輸出）：{metrics.prompt_tokens}／{metrics.completion_tokens}")
+                        if sent is not None:
+                            published_proposal_metrics[record.meeting_id] = signature
+                            if status_store is not None:
+                                status_store.remember_metrics(guild_id, record.meeting_id, signature)
+            except Exception as error:
+                logger.warning("流程收尾通知失敗 guild_id=%s error_type=%s", guild_id, type(error).__name__)
+            finally:
+                if active_progress.get(guild_id, (None,))[0] is progress:
+                    active_progress.pop(guild_id, None)
+
+    async def send_business_channel(guild_id, channel, kind, data, *, stage=None, next_step=None):
+        record = await latest_record(guild_id)
+        pages = (build_review_embeds(data, record, stage=stage or "草案") if kind == "review"
+            else build_proposal_embeds(data, record, stage=stage or "PM 草案", next_step=next_step))
+        for embed in pages:
+            await router.send(guild_id, "meeting", channel, embed=embed)
+
+    async def send_business(interaction, kind, data, *, stage=None):
+        if getattr(interaction, "channel", None) is None:
+            pages = build_review_embeds(data, stage=stage or "草案") if kind == "review" else build_proposal_embeds(data, stage=stage or "PM 草案")
+            for embed in pages:
+                await safe_followup_send(interaction, embed=embed)
+        else:
+            await send_business_channel(interaction.guild_id, interaction.channel, kind, data, stage=stage)
+
+    async def display_step_embeds(guild_id, channel, current, total, step, interaction=None):
+        record = await latest_record(guild_id)
+        for embed in build_discussion_embeds(step, record, current=current, total=total):
+            if channel is None and interaction is not None:
+                await safe_followup_send(interaction, embed=embed)
+            else:
+                await router.send(guild_id, "meeting", channel, embed=embed)
+        stats = (f"Agent：{step.agent_name}｜第 {step.round_number} 輪｜耗時 {step.execution_time_seconds} 秒"
+            f"\n輸入／輸出字元：{step.input_characters}／{step.output_characters}"
+            f"｜推論用量（輸入／輸出）：{step.prompt_tokens}／{step.completion_tokens}"
+            f"\n專案 {record.project_id if record else '?'}｜會議 {record.meeting_id if record else '?'}")
+        await router.send(guild_id, "dev_log", channel, content=stats)
+
+    presenter = DecisionPresenter(bot, decision_service, format_proposal_embed, format_review_embed,
+        router=router, run_workflow=run_workflow) if decision_service is not None else None
     bot.restore_decisions = presenter.restore if presenter else None
 
     def owner_kwargs(user_id):
@@ -555,67 +653,54 @@ def create_bot(
         sent = await presenter.present(record, channel)
         if not sent:
             logger.warning("決策等待顯示，可由 /review 或 /decide 恢復 guild_id=%s", guild_id)
+            await router.send(guild_id, "meeting", channel, content="❌ 決策資料已保存，但畫面未完整送出。請用 /review 重新顯示，或 /decide 操作目前選項。")
         return True
 
 
     async def send_intake(channel: discord.abc.Messageable, content: str | None = None, *, embed: discord.Embed | None = None) -> bool:
         try:
-            await channel.send(content, embed=embed)
+            for chunk in split_message_chunks(content or "", min(settings.max_meeting_message_length, 1900)):
+                await channel.send(chunk or None, embed=embed, allowed_mentions=discord.AllowedMentions.none())
             return True
-        except discord.HTTPException as error:
+        except DELIVERY_ERRORS as error:
             logger.warning("專案入口訊息傳送失敗 error_type=%s", type(error).__name__)
             return False
 
     async def display_intake_step(
         channel: discord.abc.Messageable, current: int, total: int, step: MeetingStepRecord,
     ) -> None:
-        for output in format_discussion_messages(
-            step.agent_name, current, total, step.output_data or {},
-            max_length=settings.max_meeting_message_length,
-            round_number=step.round_number if step.round_number == 2 else None,
-            execution_time_seconds=step.execution_time_seconds,
-            input_characters=step.input_characters,
-            output_characters=step.output_characters,
-            max_prompt_characters=settings.max_meeting_prompt_length,
-            max_response_characters=settings.max_meeting_response_length,
-            prompt_tokens=step.prompt_tokens,
-            completion_tokens=step.completion_tokens,
-            max_output_tokens=step.max_output_tokens,
-        ):
-            await send_intake(channel, output)
+        await display_step_embeds(getattr(getattr(channel, "guild", None), "id", 0), channel, current, total, step)
 
     async def display_intake_draft(guild_id: int, channel: discord.abc.Messageable) -> None:
-        draft = await discussion_manager.create_proposal_draft(
-            guild_id, allow_first_round_only=True,
-        )
-        metrics = await resolve_repository_result(discussion_manager.get_proposal_metrics(guild_id))
-        await send_intake(channel, embed=format_proposal_embed(
-            draft, metrics=metrics,
-            max_prompt_characters=settings.max_meeting_prompt_length,
-            max_response_characters=settings.max_meeting_response_length,
-        ))
+        draft = await run_workflow(discussion_manager.create_proposal_draft, guild_id, allow_first_round_only=True, channel=channel)
+        await send_business_channel(guild_id, channel, 'proposal', draft, next_step=f'回到 {getattr(channel, "mention", "原 requests 頻道")} 回覆「直接定稿」或「修改：具體需求」。')
 
     async def finalize_intake(guild_id: int, channel: discord.abc.Messageable) -> None:
-        result = await discussion_manager.review_and_finalize(guild_id)
-        await send_intake(channel, embed=format_review_embed(
-            result.review, stage="草案" if result.revision_performed else None,
-        ))
+        result = await run_workflow(discussion_manager.review_and_finalize, guild_id, channel=channel)
+        await send_business_channel(guild_id, channel, 'review', result.review, stage="草案" if result.revision_performed else None)
         if await present_decision(guild_id, channel, getattr(result, "decision_status", "legacy")):
             return
         if result.revision_performed:
             await send_intake(channel, f"🔧 已由 **{result.revision_agent_name}** 完成一次修改。")
             final_review = result.review.get("post_revision_review")
             if isinstance(final_review, dict):
-                await send_intake(channel, embed=format_review_embed(final_review, stage="最終方案"))
-        metrics = await resolve_repository_result(discussion_manager.get_final_proposal_metrics(guild_id))
-        await send_intake(channel, embed=format_proposal_embed(
-            result.final_proposal, metrics=metrics,
-            max_prompt_characters=settings.max_meeting_prompt_length,
-            max_response_characters=settings.max_meeting_response_length,
-        ))
+                await send_business_channel(guild_id, channel, 'review', final_review, stage="最終方案")
+        await send_business_channel(guild_id, channel, 'proposal', result.final_proposal, stage='已完成方案（舊流程）')
+
+    submission_service = ProjectSubmissionService(project_repository)
 
     @bot.listen("on_message")
     async def project_intake_message(message: discord.Message) -> None:
+        try:
+            await process_project_intake(message)
+        except Exception as error:
+            session = intake.get(message.guild.id, message.channel.id, message.author.id) if message.guild else None
+            if session is not None:
+                session.running = False
+            await bot.error_handler.handle(error, ErrorContext(guild_id=getattr(message.guild, 'id', None),
+                write_outcome='unknown'), channel=message.channel)
+
+    async def process_project_intake(message: discord.Message) -> None:
         """只在指定頻道回應明確專案意圖，保留原有 prefix commands。"""
 
         if (not settings.project_intake_channel_id
@@ -669,6 +754,21 @@ def create_bot(
         if session.running:
             return
         session.updated_at = time.monotonic()
+        if session.stage == 'write_outcome_unknown':
+            if content == '查證':
+                try:
+                    await submission_service.reconcile_submission(session)
+                except Exception as error:
+                    await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id,
+                        write_outcome='unknown'), channel=message.channel)
+                    return
+                await send_intake(message.channel, f'✅ 專案已保存；使用 /start project_id:{session.project_id} 接續。')
+            else:
+                await send_intake(message.channel, '❌ 建立結果尚未確認。請回覆「查證」或先 /projects 查詢；不要重複建立。')
+            return
+        if session.stage == 'submission_verified':
+            await send_intake(message.channel, f'專案已保存；使用 /start project_id:{session.project_id} 接續。')
+            return
         if content == "取消" and session.project_id is None:
             intake.cancel(session)
             await send_intake(message.channel, f"{message.author.mention} 已取消這份專案草稿；資料庫沒有新增專案。")
@@ -698,7 +798,7 @@ def create_bot(
                 except MeetingManagerError as error:
                     session.running = False
                     session.updated_at = time.monotonic()
-                    await send_intake(message.channel, f"❌ 審查尚未完成：{error}。可回覆「直接定稿」重試。")
+                    await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
                     return
                 intake.cancel(session)
                 return
@@ -718,26 +818,23 @@ def create_bot(
                     )
                 except ProjectRepositoryError as error:
                     session.running = False
-                    await send_intake(message.channel, f"❌ 無法保存需求變更：{error}")
+                    await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
                     return
                 session.change_id = change.id
                 session.change = change
                 session.stage = "second_round_failed"
                 await send_intake(message.channel, f"已記錄變更 {change.id}，開始第二輪討論……")
                 try:
-                    await discussion_manager.start_second_round(
-                        message.guild.id, change,
-                        on_step=lambda current, total, step: display_intake_step(
+                    await run_workflow(discussion_manager.start_second_round, message.guild.id, change, on_step=lambda current, total, step: display_intake_step(
                             message.channel, current, total, step,
-                        ),
-                    )
+                        ), channel=message.channel)
                     session.stage = "second_round_complete"
                     await display_intake_draft(message.guild.id, message.channel)
                     await finalize_intake(message.guild.id, message.channel)
                 except MeetingManagerError as error:
                     session.running = False
                     session.updated_at = time.monotonic()
-                    await send_intake(message.channel, f"❌ 第二輪或審查中斷：{error}。回覆「重試」接續；專案與變更已保存。")
+                    await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
                     return
                 intake.cancel(session)
                 return
@@ -751,18 +848,15 @@ def create_bot(
             try:
                 if session.stage == "second_round_failed" and session.change is not None:
                     try:
-                        await discussion_manager.start_second_round(
-                            message.guild.id, session.change,
-                            on_step=lambda current, total, step: display_intake_step(
+                        await run_workflow(discussion_manager.start_second_round, message.guild.id, session.change, on_step=lambda current, total, step: display_intake_step(
                                 message.channel, current, total, step,
-                            ),
-                        )
+                            ), channel=message.channel)
                     except MeetingManagerError:
                         # 第二輪若已部分執行，start_second_round 會拒絕重複套用；
                         # resume 只會接續已保存的失敗步驟。
-                        await discussion_manager.resume(message.guild.id)
+                        await run_workflow(discussion_manager.resume, message.guild.id, channel=message.channel)
                 elif session.stage == "first_round_failed":
-                    await discussion_manager.resume(message.guild.id)
+                    await run_workflow(discussion_manager.resume, message.guild.id, channel=message.channel)
                 session.stage = (
                     "first_round_complete" if session.stage.startswith("first")
                     else "second_round_complete"
@@ -776,7 +870,7 @@ def create_bot(
                     intake.cancel(session)
                     return
             except MeetingManagerError as error:
-                await send_intake(message.channel, f"❌ 接續失敗：{error}。請檢查已保存的會議狀態。")
+                await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
             finally:
                 session.running = False
                 session.updated_at = time.monotonic()
@@ -794,7 +888,7 @@ def create_bot(
                 workspace = await workspace_repository.get_or_create(message.guild.id, message.guild.name)
             except WorkspaceRepositoryError as error:
                 session.running = False
-                logger.warning("專案入口無法讀取工作區 guild_id=%s: %s", message.guild.id, error)
+                logger.warning("專案入口無法讀取工作區 guild_id=%s: %s", message.guild.id, type(error).__name__)
                 await send_intake(message.channel, "❌ 無法讀取工作區，稍後回覆「確認」重試。")
                 return
             if workspace.current_project_id:
@@ -807,37 +901,37 @@ def create_bot(
                 await send_intake(message.channel, "❌ 目前沒有可用的自訂專案 Repository。")
                 return
             try:
-                project = await resolve_repository_result(create(message.guild.id, **session.fields))
+                project = await submission_service.submit(session)
             except ProjectRepositoryError as error:
                 session.running = False
-                logger.warning("專案入口建立失敗 guild_id=%s: %s", message.guild.id, error)
-                await send_intake(message.channel, "❌ 專案建立失敗，草稿已保留；稍後回覆「確認」重試。")
+                logger.warning("專案入口建立失敗 guild_id=%s: %s", message.guild.id, type(error).__name__)
+                await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id,
+                    write_outcome='unknown' if session.stage == 'write_outcome_unknown' else 'not_started'), channel=message.channel)
                 return
             session.project_id = project.id
+            meeting_target = router.resolve(message.guild.id, "meeting", message.channel)
+            status_target = router.resolve(message.guild.id, "status", message.channel)
+            await send_intake(message.channel, f"討論與決策請看 {getattr(meeting_target, 'mention', '本頻道')}，進度請看 {getattr(status_target, 'mention', '本頻道')}。草案後的「直接定稿／修改」仍在本頻道回覆；隨時可用 /status。")
             await send_intake(message.channel, f"✅ 已建立 {project.id}｜{project.title}。先進行第一輪討論，完成後給你看草案。")
             try:
                 active_project = await meeting_service.prepare_project(message.guild.id, project.id)
             except ProjectMeetingError as error:
-                logger.warning("專案入口無法開會 guild_id=%s project_id=%s: %s", message.guild.id, project.id, error)
+                logger.warning("專案入口無法開會 guild_id=%s project_id=%s: %s", message.guild.id, project.id, type(error).__name__)
                 intake.cancel(session)
-                await send_intake(message.channel, f"❌ 專案已建立，但會議未啟動：{error}。可稍後使用 `/start project_id:{project.id}`。")
+                await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
                 return
             session.stage = "first_round_failed"
             try:
-                await discussion_manager.start_first_round(
-                    message.guild.id, active_project.id, meeting_requirement(active_project),
-                    **owner_kwargs(message.author.id),
-                    on_step=lambda current, total, step: display_intake_step(
+                await run_workflow(discussion_manager.start_first_round, message.guild.id, active_project.id, meeting_requirement(active_project), **owner_kwargs(message.author.id), on_step=lambda current, total, step: display_intake_step(
                         message.channel, current, total, step,
-                    ),
-                )
+                    ), channel=message.channel)
                 session.stage = "first_round_complete"
                 await display_intake_draft(message.guild.id, message.channel)
             except MeetingManagerError as error:
                 session.running = False
                 session.updated_at = time.monotonic()
-                logger.warning("專案入口第一輪失敗 guild_id=%s project_id=%s: %s", message.guild.id, project.id, error)
-                await send_intake(message.channel, f"❌ 第一輪或草案中斷：{error}。回覆「重試」接續；專案已保存。")
+                logger.warning("專案入口第一輪失敗 guild_id=%s project_id=%s: %s", message.guild.id, project.id, type(error).__name__)
+                await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id, write_outcome="unknown"), channel=message.channel)
                 return
             session.stage = "preview"
             session.running = False
@@ -860,9 +954,15 @@ def create_bot(
         projects = await resolve_repository_result(project_repository.list_projects())
         return [item for item in projects if item.owner_guild_id is None or item.owner_guild_id == guild_id]
 
+    async def visible_project_listing(guild_id: int | None) -> ProjectListing:
+        method = getattr(project_repository, "list_for_guild_with_issues", None)
+        if guild_id is not None and callable(method):
+            return await resolve_repository_result(method(guild_id))
+        return ProjectListing(await visible_projects(guild_id))
+
     @bot.event  # 將下方函式註冊為 Bot 上線事件。
     async def on_ready() -> None:  # Bot 登入並準備完成時觸發。
-        logger.info("機器人已上線：%s", bot.user)
+        logger.info("機器人已上線")
 
     @bot.command(name="hello")  # 註冊 !hello 文字指令。
     async def hello(ctx: commands.Context) -> None:  # ctx 包含使用者、頻道等指令資訊。
@@ -876,7 +976,8 @@ def create_bot(
 
         # 先回應 Discord，避免較久的工作讓 Interaction 在三秒內逾時。
         # thinking=True 會顯示「機器人正在思考」，ephemeral=True 代表只有本人看得到。
-        await interaction.response.defer(thinking=True, ephemeral=True)
+        if not await safe_defer(interaction, thinking=True, ephemeral=True):
+            return
 
         # defer() 已經使用第一次 Interaction 回應，後續訊息必須改用 followup。
         await interaction.followup.send(
@@ -896,20 +997,22 @@ def create_bot(
             return  # 輸入不合法時提前結束，不呼叫 Ollama。
 
         # ctx.send() 會回傳訊息物件，保存後才能在模型完成時編輯內容。
-        processing_message = await ctx.send("⏳ Qwen 正在處理你的問題，請稍候……")
+        processing_message = await safe_channel_send(ctx, "⏳ Qwen 正在處理你的問題，請稍候……")
+        if processing_message is None:
+            return
         logger.info("開始處理 !ask（輸入長度=%s）", len(question))  # 只記錄長度，不記錄問題。
 
         try:
             result = await llm_service.chat(question)  # 非同步等待 Qwen 產生回答。
         except LLMServiceError as error:
             # LLMService 已將未啟動、逾時等底層例外轉成安全訊息。
-            logger.warning("!ask 執行失敗：%s", error)
-            await processing_message.edit(content=f"❌ {error}")  # 將處理中訊息改成錯誤原因。
+            logger.warning("!ask 執行失敗 exception_type=%s", type(error).__name__)
+            await safe_message_edit(processing_message, content=safe_error_text(error, ErrorContext(command="ask")))  # 將處理中訊息改成錯誤原因。
             return  # 錯誤發生後停止後續流程。
 
         # 從 LLMResponse 取出文字，並限制 Discord 訊息長度。
         answer = truncate_answer(result.content, settings.max_ask_output_length)
-        await processing_message.edit(content=answer)  # 將原本的處理中訊息改成模型回答。
+        await safe_message_edit(processing_message, content=answer)  # 將原本的處理中訊息改成模型回答。
         logger.info("!ask 處理完成（輸出長度=%s）", len(answer))  # 不記錄回答內容。
 
     @bot.tree.command(name="help", description="顯示機器人指令說明")
@@ -918,9 +1021,17 @@ def create_bot(
 
         embed = discord.Embed(  # 建立格式化的 Discord 說明卡片。
             title="🤖 機器人指令說明",
-            description="以下是目前可以使用的指令：",
+            description="需求確認 → Agent 討論 → PM 草案 → 審查 → 你選擇方向 → 重新評分 → 你批准或駁回。批准後專案才完成。",
             color=discord.Color.green(),
         )
+        entry = f"<#{settings.project_intake_channel_id}>" if settings.project_intake_channel_id else "/projects 選案後用 /start"
+        meeting_channel = router.resolve(interaction.guild_id, "meeting", getattr(interaction, "channel", None)) if getattr(interaction, "guild_id", None) else None
+        status_channel = router.resolve(interaction.guild_id, "status", getattr(interaction, "channel", None)) if getattr(interaction, "guild_id", None) else None
+        entry_action = (f"前往 {entry} 輸入「我要做一個網站」，按提示補充需求後回覆「確認」。"
+            if settings.project_intake_channel_id else "自然語言入口尚未啟用。先用 /projects 選案，再用 /start project_id:專案ID。")
+        embed.add_field(name="在哪裡操作", value=f"Agent 討論與決策：{getattr(meeting_channel, 'mention', '原操作頻道')}；進度：{getattr(status_channel, 'mention', '原操作頻道')}。自然語言草案回覆留在原 requests 頻道。", inline=False)
+
+        embed.add_field(name="目前該做什麼", value="/status 顯示目前階段、操作者、操作位置與下一步。只有會議啟動者能選擇與批准。", inline=False)
         embed.add_field(name="/help", value="顯示這份 Embed 指令說明。", inline=False)
         embed.add_field(
             name="/hello",
@@ -944,6 +1055,11 @@ def create_bot(
             inline=False,
         )
         embed.add_field(
+            name="/cleanup",
+            value="清理目前頻道最近 100 則由 Bot 發送的訊息；需要管理訊息權限。",
+            inline=False,
+        )
+        embed.add_field(
             name="/meeting <project_id> <change_id>",
             value="完成兩輪討論與審查，再選擇方案方向並批准。",
             inline=False,
@@ -954,6 +1070,7 @@ def create_bot(
                 value=f"到 <#{settings.project_intake_channel_id}> 輸入「我要做一個網站」，先看第一輪草案，再決定是否修改。",
                 inline=False,
             )
+        embed.add_field(name="/resume", value="接續失敗的討論步驟；審查／決策中斷用 /review 或 /decide。", inline=False)
         embed.add_field(name="/workspace", value="查看工作區設定與成果數。", inline=False)
         embed.add_field(name="/priority <priority>", value="設定下一場會議的預設優先目標。", inline=False)
         embed.add_field(
@@ -972,6 +1089,7 @@ def create_bot(
             value="審查草案並顯示決策狀態；新版方案批准後才會完成專案。",
             inline=False,
         )
+        embed.add_field(name="錯誤與恢復", value="錯誤卡會顯示保存狀態與查詢代碼。先 /status 確認；討論用 /resume，審查用 /review。建立或批准結果不明時先查證，不要重送。", inline=False)
         embed.set_footer(text=f"查詢者：{interaction.user.display_name}")  # 顯示查詢者名稱。
         # ephemeral=True 代表只有執行 /help 的使用者看得到訊息。
         await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -980,29 +1098,27 @@ def create_bot(
     async def projects_command(interaction: discord.Interaction) -> None:
         """從 Repository 取得專案，再使用 Embed 顯示在 Discord。"""
 
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         try:
-            projects = await visible_projects(getattr(interaction, "guild_id", None))
+            listing = await visible_project_listing(getattr(interaction, "guild_id", None))
+            projects = listing.projects
         except ProjectRepositoryError as error:
-            logger.error("讀取專案資料失敗：%s", error)
-            await interaction.response.send_message(
-                "❌ 無法讀取專案資料，請稍後再試。",
-                ephemeral=True,
-            )
+            logger.error("讀取專案資料失敗：%s", type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="not_started"), interaction=interaction)
             return
 
-        embed = discord.Embed(
-            title="📁 專案清單",
-            description=f"目前共有 {len(projects)} 個專案。",
-            color=discord.Color.blue(),
-        )
+        summary = discord.Embed(title="📁 專案清單", description=f"目前共有 {len(projects)} 個專案。", color=discord.Color.blue())
+        if listing.invalid_count:
+            # 不顯示異常資料原文；舊紀錄保留，等待管理員查核與補齊。
+            summary.add_field(name="⚠️ 資料待修復", value=(
+                f"另有 {listing.invalid_count} 筆專案資料不完整，已暫時排除顯示。"
+                "請管理員檢查需求、驗收條件及其他欄位；紀錄未刪除。"
+            ), inline=False)
+        await safe_followup_send(interaction, embed=summary, ephemeral=True)
         for project in projects:
-            embed.add_field(
-                name=f"{project.id}｜{project.title}" + ("（自訂）" if project.owner_guild_id is not None else ""),
-                value=format_project(project),
-                inline=False,
-            )
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+            for embed in build_project_embeds(project):
+                await safe_followup_send(interaction, embed=embed, ephemeral=True)
         logger.info("已顯示 %s 個專案", len(projects))
 
     @bot.tree.command(name="workspace", description="查看工作區、預設優先目標與成果數")
@@ -1010,19 +1126,110 @@ def create_bot(
         if interaction.guild_id is None or workspace_repository is None:
             await interaction.response.send_message("❌ 請在已設定資料庫的 Discord 伺服器中使用。", ephemeral=True)
             return
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         try:
             workspace = await workspace_repository.get_or_create(
                 interaction.guild_id, interaction.guild.name if interaction.guild else "Discord 工作區"
             )
         except WorkspaceRepositoryError as error:
-            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
         embed = discord.Embed(title=f"🏢 {workspace.name}", color=discord.Color.blue())
         embed.add_field(name="預設優先目標", value=workspace.default_priority.label)
         embed.add_field(name="目前專案", value=workspace.current_project_id or "無")
         embed.add_field(name="已完成自訂專案數", value=str(workspace.completed_custom_projects))
         embed.add_field(name="已產生最終方案的專案數", value=str(workspace.projects_with_final_proposal))
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await safe_followup_send(interaction, embed=embed, ephemeral=True)
+
+    @bot.tree.command(name="resume", description="接續討論階段失敗的 Agent 步驟")
+    async def resume_command(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("❌ /resume 只能在伺服器使用。", ephemeral=True)
+            return
+        if not await safe_defer(interaction, thinking=True):
+            return
+        await safe_followup_send(interaction, "⏳ 正在接續已保存的討論；可用 /status 查看進度。")
+        try:
+            await run_workflow(discussion_manager.resume, interaction.guild_id, channel=getattr(interaction, "channel", None))
+        except MeetingManagerError as error:
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
+            return
+        await safe_followup_send(interaction, "✅ 討論已接續完成。下一步：/draft，再 /review。")
+
+    @bot.tree.command(name="status", description="查看目前階段、操作者與下一步")
+    async def status_command(interaction: discord.Interaction) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message("❌ /status 只能在伺服器使用。", ephemeral=True)
+            return
+        if not await safe_defer(interaction, thinking=True, ephemeral=True):
+            return
+        user_id = getattr(interaction.user, "id", None)
+        session = intake.get(interaction.guild_id, settings.project_intake_channel_id, user_id)
+        if session is not None and not session.running and (session.project_id is None or session.stage == "preview"):
+            for embed in build_intake_status_embeds(session):
+                await safe_followup_send(interaction, embed=embed, ephemeral=True)
+            return
+        try:
+            record = await latest_record(interaction.guild_id, strict=True)
+        except MeetingManagerError as error:
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
+            return
+        locks = getattr(discussion_manager, "_guild_locks", {})
+        running = bool(locks.get(interaction.guild_id) and locks[interaction.guild_id].locked())
+        running = running or interaction.guild_id in getattr(discussion_manager, "_full_workflow_guilds", set())
+        active = active_progress.get(interaction.guild_id)
+        pages = build_status_embeds(record, is_running=running, event=active[1] if active else None)
+        # 每次指令都有自己的等待訊息，必須回覆這次互動才能結束「思考中」。
+        # 私人查詢不更新公開狀態卡，也不復用另一個 Interaction 的訊息。
+        for page in pages:
+            await safe_followup_send(interaction, embed=page, ephemeral=True)
+
+    @bot.tree.command(name="cleanup", description="清理目前頻道中 Bot 發送的舊訊息")
+    async def cleanup_command(interaction: discord.Interaction) -> None:
+        """只刪除目前頻道的 Bot 訊息，保留使用者訊息與資料庫紀錄。"""
+
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "❌ /cleanup 只能在伺服器頻道使用。", ephemeral=True
+            )
+            return
+        permissions = getattr(interaction.user, "guild_permissions", None)
+        if permissions is None or not permissions.manage_messages:
+            await interaction.response.send_message(
+                "❌ 只有具備「管理訊息」權限的人可以清理頻道。", ephemeral=True
+            )
+            return
+        channel = getattr(interaction, "channel", None)
+        if channel is None or not hasattr(channel, "history"):
+            await interaction.response.send_message(
+                "❌ 目前頻道不支援訊息清理。", ephemeral=True
+            )
+            return
+
+        if not await safe_defer(interaction, ephemeral=True):
+            return
+        bot_user = bot.user
+        deleted = 0
+        try:
+            # 只掃描最近 100 則，避免一次操作時間過長；不刪除使用者訊息。
+            async for message in channel.history(limit=100):
+                if bot_user is not None and message.author.id == bot_user.id:
+                    try:
+                        await message.delete()
+                        deleted += 1
+                    except DELIVERY_ERRORS:
+                        logger.warning(
+                            "清理訊息失敗 channel_id=%s message_id=%s",
+                            getattr(channel, "id", None), message.id,
+                        )
+        except DELIVERY_ERRORS as error:
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
+            return
+        await interaction.followup.send(
+            f"✅ 已清理目前頻道中的 {deleted} 則 Bot 訊息；資料庫紀錄未刪除。",
+            ephemeral=True,
+        )
 
     @bot.tree.command(name="priority", description="設定下一場會議的預設優先目標")
     @app_commands.choices(priority=[
@@ -1038,6 +1245,8 @@ def create_bot(
         if permissions is None or not permissions.manage_guild:
             await interaction.response.send_message("❌ 只有伺服器管理員可設定優先目標。", ephemeral=True)
             return
+        if not await safe_defer(interaction, ephemeral=True):
+            return
         try:
             await workspace_repository.get_or_create(
                 interaction.guild_id, interaction.guild.name if interaction.guild else "Discord 工作區"
@@ -1046,9 +1255,9 @@ def create_bot(
                 interaction.guild_id, ProjectPriority(priority.value)
             )
         except (WorkspaceRepositoryError, ValueError) as error:
-            await interaction.response.send_message(f"❌ 無法設定優先目標：{error}", ephemeral=True)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
-        await interaction.response.send_message(
+        await safe_followup_send(interaction,
             f"✅ 預設優先目標已設為 **{workspace.default_priority.label}**，下一場新會議生效。",
             ephemeral=True,
         )
@@ -1072,14 +1281,15 @@ def create_bot(
             )
             return
 
-        await interaction.response.defer(thinking=True)
+        if not await safe_defer(interaction, thinking=True):
+            return
         normalized_project_id = project_id.strip().upper()
         normalized_change_id = change_id.strip().upper()
         try:
             projects = await visible_projects(interaction.guild_id)
         except ProjectRepositoryError as error:
-            logger.error("/meeting 無法讀取專案資料：%s", error)
-            await safe_followup_send(interaction, "❌ 無法讀取專案資料，請稍後再試。")
+            logger.error("/meeting 無法讀取專案資料：%s", type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
         project = next(
@@ -1087,10 +1297,7 @@ def create_bot(
             None,
         )
         if project is None:
-            await safe_followup_send(
-                interaction,
-                f"❌ 找不到專案 ID：{normalized_project_id}。",
-            )
+            await bot.error_handler.handle(AppError(code=ErrorCode.PROJECT_NOT_FOUND), ErrorContext(guild_id=interaction.guild_id), interaction=interaction)
             return
         requirement_change = next(
             (
@@ -1101,10 +1308,7 @@ def create_bot(
             None,
         )
         if requirement_change is None:
-            await safe_followup_send(
-                interaction,
-                f"❌ 找不到專案 {project.id} 的需求變更：{normalized_change_id}。",
-            )
+            await bot.error_handler.handle(AppError(code=ErrorCode.PROJECT_NOT_FOUND), ErrorContext(guild_id=interaction.guild_id), interaction=interaction)
             return
 
         prepare_project = getattr(meeting_service, "prepare_project", None)
@@ -1115,8 +1319,8 @@ def create_bot(
                 else await meeting_service.start_project(interaction.guild_id, project.id)
             )
         except ProjectMeetingError as error:
-            logger.warning("/meeting 無法準備專案 guild_id=%s：%s", interaction.guild_id, error)
-            await safe_followup_send(interaction, f"❌ {error}")
+            logger.warning("/meeting 無法準備專案 guild_id=%s：%s", interaction.guild_id, type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
         await safe_followup_send(
@@ -1130,45 +1334,16 @@ def create_bot(
             total: int,
             step: MeetingStepRecord,
         ) -> None:
-            messages = format_discussion_messages(
-                step.agent_name,
-                current,
-                total,
-                step.output_data or {},
-                max_length=settings.max_meeting_message_length,
-                round_number=step.round_number if step.round_number == 2 else None,
-                execution_time_seconds=step.execution_time_seconds,
-                input_characters=step.input_characters,
-                output_characters=step.output_characters,
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-                prompt_tokens=step.prompt_tokens,
-                completion_tokens=step.completion_tokens,
-                max_output_tokens=step.max_output_tokens,
-            )
-            for message in messages:
-                await safe_followup_send(interaction, message)
+            await display_step_embeds(interaction.guild_id, getattr(interaction, "channel", None), current, total, step, interaction)
 
         try:
-            result = await discussion_manager.run_full_meeting(
-                interaction.guild_id,
-                active_project.id,
-                meeting_requirement(active_project),
-                requirement_change,
-                **(owner_kwargs(interaction.user.id) if presenter else {}),
-                on_step=display_step,
-            )
+            result = await run_workflow(discussion_manager.run_full_meeting, interaction.guild_id, active_project.id, meeting_requirement(active_project), requirement_change, **owner_kwargs(interaction.user.id) if presenter else {}, on_step=display_step, channel=getattr(interaction, "channel", None))
         except MeetingManagerError as error:
-            logger.warning("/meeting 執行失敗 guild_id=%s：%s", interaction.guild_id, error)
-            await safe_followup_send(
-                interaction,
-                f"❌ 完整會議失敗：{error}\n可重新執行相同指令以接續已保存的階段。",
-            )
+            logger.warning("/meeting 執行失敗 guild_id=%s：%s", interaction.guild_id, type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
-        await safe_followup_send(interaction, embed=format_review_embed(
-            result.review, stage="草案" if result.revision_performed else None,
-        ))
+        await send_business(interaction, 'review', result.review, stage="草案" if result.revision_performed else None)
         if await present_decision(interaction.guild_id, getattr(interaction, "channel", None), getattr(result, "decision_status", "legacy")):
             return
         if result.revision_performed:
@@ -1178,20 +1353,8 @@ def create_bot(
             )
             final_review = result.review.get("post_revision_review")
             if isinstance(final_review, dict):
-                await safe_followup_send(
-                    interaction, embed=format_review_embed(final_review, stage="最終方案"),
-                )
-        await safe_followup_send(
-            interaction,
-            embed=format_proposal_embed(
-                result.final_proposal,
-                metrics=await resolve_repository_result(
-                    discussion_manager.get_final_proposal_metrics(interaction.guild_id)
-                ),
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-            ),
-        )
+                await send_business(interaction, 'review', final_review, stage="最終方案")
+        await send_business(interaction, 'proposal', result.final_proposal, stage='已完成方案（舊流程）')
         logger.info("完整會議完成 guild_id=%s meeting_id=%s", interaction.guild_id, result.record.meeting_id)
 
     @bot.tree.command(name="start", description="啟動指定專案的會議")
@@ -1210,15 +1373,16 @@ def create_bot(
             return
 
         # 第一輪發言需要讓伺服器成員看見，因此使用公開的 defer 與 Followup。
-        await interaction.response.defer(thinking=True)
+        if not await safe_defer(interaction, thinking=True):
+            return
         try:
             project = await meeting_service.start_project(
                 interaction.guild_id,
                 project_id,
             )
         except ProjectMeetingError as error:
-            logger.warning("/start 失敗 guild_id=%s：%s", interaction.guild_id, error)
-            await interaction.followup.send(f"❌ {error}")
+            logger.warning("/start 失敗 guild_id=%s：%s", interaction.guild_id, type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
         embed = discord.Embed(
@@ -1235,47 +1399,22 @@ def create_bot(
             total: int,
             step: MeetingStepRecord,
         ) -> None:
-            """每位 Agent 完成後，立即把進度與完整發言送到 Discord。"""
-
-            output_data = step.output_data or {}
-            messages = format_discussion_messages(
-                step.agent_name,
-                current,
-                total,
-                output_data,
-                max_length=settings.max_meeting_message_length,
-                execution_time_seconds=step.execution_time_seconds,
-                input_characters=step.input_characters,
-                output_characters=step.output_characters,
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-                prompt_tokens=step.prompt_tokens,
-                completion_tokens=step.completion_tokens,
-                max_output_tokens=step.max_output_tokens,
-            )
-            for message in messages:
-                await interaction.followup.send(message)
+            await display_step_embeds(interaction.guild_id, getattr(interaction, "channel", None), current, total, step, interaction)
 
         requirement = meeting_requirement(project)
         try:
-            await discussion_manager.start_first_round(
-                interaction.guild_id,
-                project.id,
-                requirement,
-                **(owner_kwargs(interaction.user.id) if presenter else {}),
-                on_step=display_agent_step,
-            )
+            await run_workflow(discussion_manager.start_first_round, interaction.guild_id, project.id, requirement, **owner_kwargs(interaction.user.id) if presenter else {}, on_step=display_agent_step, channel=getattr(interaction, "channel", None))
         except MeetingManagerError as error:
             logger.warning(
                 "第一輪討論失敗 guild_id=%s project_id=%s：%s",
                 interaction.guild_id,
                 project.id,
-                error,
+                type(error).__name__,
             )
-            await interaction.followup.send(f"❌ 第一輪討論失敗：{error}")
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
-        await interaction.followup.send("✅ 第一輪討論完成。")
+        await interaction.followup.send("✅ 第一輪討論完成。下一步：/draft 整合草案；若要第二輪，先用 /change。")
         logger.info(
             "第一輪討論完成 guild_id=%s project_id=%s",
             interaction.guild_id,
@@ -1297,13 +1436,14 @@ def create_bot(
             )
             return
 
-        await interaction.response.defer(thinking=True)
+        if not await safe_defer(interaction, thinking=True):
+            return
         normalized_change_id = change_id.strip().upper()
         try:
             projects = await visible_projects(interaction.guild_id)
         except ProjectRepositoryError as error:
-            logger.error("讀取需求變更失敗：%s", error)
-            await interaction.followup.send("❌ 無法讀取需求變更資料，請稍後再試。")
+            logger.error("讀取需求變更失敗：%s", type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
         requirement_change = next(
@@ -1316,9 +1456,7 @@ def create_bot(
             None,
         )
         if requirement_change is None:
-            await interaction.followup.send(
-                f"❌ 找不到需求變更 ID：{normalized_change_id}。"
-            )
+            await bot.error_handler.handle(AppError(code=ErrorCode.PROJECT_NOT_FOUND), ErrorContext(guild_id=interaction.guild_id), interaction=interaction)
             return
 
         await interaction.followup.send(
@@ -1332,43 +1470,21 @@ def create_bot(
             total: int,
             step: MeetingStepRecord,
         ) -> None:
-            output_data = step.output_data or {}
-            messages = format_discussion_messages(
-                step.agent_name,
-                current,
-                total,
-                output_data,
-                max_length=settings.max_meeting_message_length,
-                round_number=2,
-                execution_time_seconds=step.execution_time_seconds,
-                input_characters=step.input_characters,
-                output_characters=step.output_characters,
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-                prompt_tokens=step.prompt_tokens,
-                completion_tokens=step.completion_tokens,
-                max_output_tokens=step.max_output_tokens,
-            )
-            for message in messages:
-                await interaction.followup.send(message)
+            await display_step_embeds(interaction.guild_id, getattr(interaction, "channel", None), current, total, step, interaction)
 
         try:
-            await discussion_manager.start_second_round(
-                interaction.guild_id,
-                requirement_change,
-                on_step=display_second_round_step,
-            )
+            await run_workflow(discussion_manager.start_second_round, interaction.guild_id, requirement_change, on_step=display_second_round_step, channel=getattr(interaction, "channel", None))
         except MeetingManagerError as error:
             logger.warning(
                 "第二輪討論失敗 guild_id=%s change_id=%s：%s",
                 interaction.guild_id,
                 normalized_change_id,
-                error,
+                type(error).__name__,
             )
-            await interaction.followup.send(f"❌ 第二輪討論失敗：{error}")
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
-        await interaction.followup.send("✅ 第二輪討論完成。")
+        await interaction.followup.send("✅ 第二輪討論完成。下一步：/draft 整合草案，再用 /review 審查與選擇。")
 
     @bot.tree.command(name="draft", description="由 PM 整合已完成的討論並顯示提案摘要")
     async def draft_command(interaction: discord.Interaction) -> None:
@@ -1381,46 +1497,24 @@ def create_bot(
             )
             return
 
-        await interaction.response.defer(thinking=True)
+        if not await safe_defer(interaction, thinking=True):
+            return
+        await safe_followup_send(interaction, "⏳ PM 正在整合草案；進度與結果會顯示在會議／狀態頻道。")
         started_at = time.perf_counter()
         try:
-            proposal = await discussion_manager.create_proposal_draft(
-                interaction.guild_id
-            )
+            proposal = await run_workflow(discussion_manager.create_proposal_draft, interaction.guild_id, channel=getattr(interaction, "channel", None))
         except MeetingManagerError as error:
             execution_time = time.perf_counter() - started_at
             logger.warning(
                 "/draft 失敗 guild_id=%s execution_seconds=%.3f：%s",
                 interaction.guild_id,
                 execution_time,
-                error,
+                type(error).__name__,
             )
-            await interaction.followup.send(
-                f"❌ 建立整合草案失敗：{error}\n"
-                f"處理耗時：{execution_time:.2f} 秒"
-            )
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
-        execution_time = time.perf_counter() - started_at
-        metrics_getter = getattr(
-            discussion_manager,
-            "get_proposal_metrics",
-            None,
-        )
-        metrics = (
-            await resolve_repository_result(metrics_getter(interaction.guild_id))
-            if callable(metrics_getter)
-            else None
-        )
-        await interaction.followup.send(
-            embed=format_proposal_embed(
-                proposal,
-                execution_time_seconds=execution_time,
-                metrics=metrics,
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-            )
-        )
+        await send_business(interaction, 'proposal', proposal)
         logger.info("PM 整合草案完成 guild_id=%s", interaction.guild_id)
 
     @bot.tree.command(name="decide", description="選擇方案方向，或批准／駁回待確認方案")
@@ -1436,14 +1530,18 @@ def create_bot(
         if interaction.guild_id is None or presenter is None:
             await interaction.response.send_message("❌ /decide 只能在有使用者決策會議的伺服器使用。", ephemeral=True)
             return
-        await interaction.response.defer(thinking=True, ephemeral=True)
-        try:
-            record = await decision_service.act(interaction.guild_id, interaction.user.id, choice)
-        except MeetingManagerError as error:
-            await safe_followup_send(interaction, f"❌ {error}", ephemeral=True)
+        if not await safe_defer(interaction, thinking=True, ephemeral=True):
             return
-        await safe_followup_send(interaction, "✅ 操作已保存。", ephemeral=True)
-        await presenter.present(record, interaction.channel)
+        await safe_original_response_edit(interaction, "⏳ 正在驗證並處理操作；公開進度可用 /status 查看。")
+        completed = False
+        try:
+            record = await run_workflow(decision_service.act, interaction.guild_id, interaction.user.id, choice, channel=getattr(interaction, "channel", None))
+            completed = True
+            await presenter.present(record, interaction.channel)
+        except MeetingManagerError as error:
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
+        finally:
+            await safe_original_response_edit(interaction, "✅ 操作已保存；請查看會議頻道的結果，或使用 /status 查詢目前階段與下一步。" if completed else "❌ 操作未完成；請查看錯誤卡。若已保存選擇，請用 /decide 重試相同選項。")
 
     @bot.tree.command(name="review", description="審查草案並顯示使用者決策狀態")
     async def review_command(interaction: discord.Interaction) -> None:
@@ -1456,103 +1554,69 @@ def create_bot(
             )
             return
 
-        await interaction.response.defer(thinking=True)
+        if not await safe_defer(interaction, thinking=True):
+            return
+        # 原互動回覆就是這次指令的提示；完成後編輯它，不另發一則完成提示。
+        await safe_original_response_edit(interaction, "⏳ 正在讀取或審查草案；請查看會議／狀態頻道，或用 /status 查詢。")
+        completed = False
         try:
-            result = await discussion_manager.review_and_finalize(
-                interaction.guild_id
+            result = await run_workflow(discussion_manager.review_and_finalize, interaction.guild_id, channel=getattr(interaction, "channel", None))
+            await send_business(interaction, 'review', result.review, stage="草案" if result.revision_performed else None)
+            if await present_decision(interaction.guild_id, getattr(interaction, "channel", None), getattr(result, "decision_status", "legacy")):
+                completed = True
+                return
+            if result.revision_performed:
+                await interaction.followup.send(
+                    "🔧 已將最高優先修改要求交給 "
+                    f"**{result.revision_agent_name}**，本會議修改次數已達 1/1。"
+                )
+                final_review = result.review.get("post_revision_review")
+                if isinstance(final_review, dict):
+                    await send_business(interaction, 'review', final_review, stage="最終方案")
+            else:
+                await interaction.followup.send("✅ 草案通過，未使用修改機會。")
+
+            await send_business(interaction, 'proposal', result.final_proposal, stage='已完成方案（舊流程）')
+            completed = True
+            logger.info(
+                "Review 與最終整合完成 guild_id=%s revision_count=%s",
+                interaction.guild_id,
+                1 if result.revision_performed else 0,
             )
         except MeetingManagerError as error:
-            logger.warning("/review 失敗 guild_id=%s：%s", interaction.guild_id, error)
-            await interaction.followup.send(f"❌ Review 審查失敗：{error}")
+            logger.warning("/review 失敗 guild_id=%s：%s", interaction.guild_id, type(error).__name__)
+            await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
-
-        await interaction.followup.send(embed=format_review_embed(
-            result.review, stage="草案" if result.revision_performed else None,
-        ))
-        if await present_decision(interaction.guild_id, getattr(interaction, "channel", None), getattr(result, "decision_status", "legacy")):
-            return
-        if result.revision_performed:
-            await interaction.followup.send(
-                "🔧 已將最高優先修改要求交給 "
-                f"**{result.revision_agent_name}**，本會議修改次數已達 1/1。"
+        finally:
+            # finally 也涵蓋上方決策重顯的 return，以及審查／畫面傳送中斷。
+            # 完成不等於批准；公開失敗提示也不包含錯誤細節或查詢代碼。
+            content = (
+                "✅ 審查處理已完成。請查看會議／狀態頻道的結果與下一步；目前狀態可用 /status 查詢。"
+                if completed else
+                "❌ 本次審查操作未完成。請查看私人錯誤回覆，或用 /status 確認保存狀態與下一步。"
             )
-            final_review = result.review.get("post_revision_review")
-            if isinstance(final_review, dict):
-                await interaction.followup.send(
-                    embed=format_review_embed(final_review, stage="最終方案")
-                )
-        else:
-            await interaction.followup.send("✅ 草案通過，未使用修改機會。")
-
-        metrics = await resolve_repository_result(
-            discussion_manager.get_final_proposal_metrics(interaction.guild_id)
-        )
-        await interaction.followup.send(
-            embed=format_proposal_embed(
-                result.final_proposal,
-                metrics=metrics,
-                max_prompt_characters=settings.max_meeting_prompt_length,
-                max_response_characters=settings.max_meeting_response_length,
-            )
-        )
-        logger.info(
-            "Review 與最終整合完成 guild_id=%s revision_count=%s",
-            interaction.guild_id,
-            1 if result.revision_performed else 0,
-        )
+            await safe_original_response_edit(interaction, content)
 
     @bot.event
     async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
-        """將常見文字指令錯誤轉成容易理解的 Discord 訊息。"""
-
-        if isinstance(error, commands.CommandNotFound):
-            await ctx.send("找不到這個指令，請輸入 `/help` 查看可用指令。")
-        elif isinstance(error, commands.MissingRequiredArgument):
-            await ctx.send(f"缺少必要參數：`{error.param.name}`")
-        elif isinstance(error, commands.BadArgument):
-            await ctx.send("參數格式不正確，請檢查後再試。")
-        elif isinstance(error, commands.CommandOnCooldown):
-            await ctx.send(f"指令冷卻中，請在 {error.retry_after:.1f} 秒後再試。")
-        elif isinstance(error, commands.MissingPermissions):
-            await ctx.send("你沒有使用這個指令的權限。")
-        elif isinstance(error, commands.CheckFailure):
-            await ctx.send("你目前無法使用這個指令。")
-        else:
-            logger.error("未處理的文字指令錯誤：%r", error)
-            await ctx.send("指令執行時發生錯誤，請稍後再試。")
+        await bot.error_handler.handle(error, ErrorContext(guild_id=getattr(ctx.guild, 'id', None),
+            write_outcome='unknown'), channel=ctx.channel)
 
     @bot.tree.error
-    async def on_app_command_error(
-        interaction: discord.Interaction,
-        error: app_commands.AppCommandError,
-    ) -> None:
-        """統一處理斜線指令錯誤。"""
-
-        if isinstance(error, app_commands.CommandOnCooldown):
-            message = f"指令冷卻中，請在 {error.retry_after:.1f} 秒後再試。"
-        elif isinstance(error, app_commands.MissingPermissions):
-            message = "你沒有使用這個指令的權限。"
-        elif isinstance(error, app_commands.TransformerError):
-            message = "參數格式不正確，請檢查後再試。"
-        elif isinstance(error, app_commands.CheckFailure):
-            message = "你目前無法使用這個指令。"
-        else:
-            logger.error("未處理的斜線指令錯誤：%r", error)
-            message = "指令執行時發生錯誤，請稍後再試。"
-
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
+    async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id,
+            write_outcome='unknown'), interaction=interaction)
 
     return bot  # 把已完成所有指令註冊的 Bot 交給 main() 或測試使用。
 
 
-def main() -> None:
+def _main() -> None:
     """讀取設定、建立相依物件並啟動 Discord Bot。"""
 
+    from pathlib import Path
+    from presentation.status_message_store import StatusMessageStore
     settings = load_settings()  # 從 .env 取得 Token、模型與限制設定。
-    configure_logging(settings.log_level)  # 啟用統一的日誌格式。
+    configure_safe_logging(settings.log_level, secrets=(settings.discord_token, settings.db_password))  # 啟用統一的日誌格式。
 
     # 將 config.py 讀到的 Ollama 設定傳給 LLMService。
     llm_service = LLMService(
@@ -1571,6 +1635,9 @@ def main() -> None:
         min_size=settings.db_pool_min_size,
         max_size=settings.db_pool_max_size,
         connect_timeout_seconds=settings.db_connect_timeout_seconds,
+        acquire_timeout_seconds=settings.db_acquire_timeout_seconds,
+        operation_timeout_seconds=settings.db_operation_timeout_seconds,
+        pool_recycle_seconds=settings.db_pool_recycle_seconds,
     )
     project_repository = MySQLProjectRepository(database)
     workspace_repository = MySQLWorkspaceRepository(database)
@@ -1601,15 +1668,28 @@ def main() -> None:
         discussion_manager,
         database,
         workspace_repository,
+        status_store=StatusMessageStore(Path(__file__).resolve().parent / ".runtime/status_messages.json"),
     )  # 將設定和服務注入 Discord Bot。
 
-    # 日誌只顯示非敏感設定，絕對不輸出 settings.discord_token。
-    logger.info(
-        "準備啟動 Bot（Ollama host=%s model=%s）",
-        settings.ollama_host,
-        settings.ollama_model,
-    )
-    bot.run(settings.discord_token)  # 使用 Token 登入 Discord 並持續運行。
+    logger.info('準備啟動 Bot')
+    try:
+        bot.run(settings.discord_token, log_handler=None)
+    except Exception as error:
+        raise AppError(code=ErrorCode.DISCORD_LOGIN_FAILED) from error
+
+
+def main() -> None:
+    configure_safe_logging()
+    try:
+        _main()
+    except Exception as error:
+        register_secrets()
+        context = ErrorContext(write_outcome='not_started')
+        wrapped = error if isinstance(error, (discord.DiscordException, AppError)) else AppError(code=ErrorCode.CONFIG_INVALID)
+        report = classify_error(wrapped, context)
+        log_error(report, context, error)
+        logger.error('%s', report.text())
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":  # 只有執行 python bot.py 時才會成立。
