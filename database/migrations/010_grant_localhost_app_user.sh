@@ -6,6 +6,8 @@ set -eu
 escaped_password=$(printf '%s' "$MYSQL_PASSWORD" | sed "s/'/''/g")
 
 MYSQL_PWD="$MYSQL_ROOT_PASSWORD" mysql --protocol=socket -uroot <<SQL
+-- 單引號以 '' 跳脫，反斜線則保留為密碼原文，不解讀成 SQL escape。
+SET SESSION sql_mode = 'NO_BACKSLASH_ESCAPES';
 CREATE USER IF NOT EXISTS 'ai_company_app'@'localhost' IDENTIFIED BY '${escaped_password}';
 ALTER USER 'ai_company_app'@'localhost' IDENTIFIED BY '${escaped_password}';
 GRANT SELECT, INSERT, UPDATE, DELETE ON ai_company.* TO 'ai_company_app'@'localhost';

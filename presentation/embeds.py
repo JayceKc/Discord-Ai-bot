@@ -75,6 +75,8 @@ def build_proposal_embeds(proposal, record=None, *, stage="PM 草案", next_step
     next_action = "請先閱讀完整方案，再查看決策與評估。"
     if stage == "PM 草案":
         next_action = "使用 /review 審查並產生使用者選項；需要第二輪時先用 /change。"
+        if record is not None and record.applied_requirement_change is not None:
+            next_action = "兩輪整合草案已完成。使用 /review 審查並產生使用者選項；需求變更已使用一次，不能再次 /change。"
     sections.append(EmbedSection("下一步", next_step or next_action))
     return paginate_embed(title=f"{stage}｜{proposal.get('title', '方案')}", description=str(proposal.get("summary", "")),
         sections=sections, profile=get_agent_profile("PM Agent"), footer=metadata(record))

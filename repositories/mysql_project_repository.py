@@ -154,7 +154,9 @@ class MySQLProjectRepository:
         except ProjectRepositoryError:
             raise
         except Exception as error:
-            raise ProjectRepositoryError("無法保存需求變更。") from error
+            report = classify_error(error)
+            raise ProjectRepositoryError("無法保存需求變更。", code=report.code,
+                operation=change_id, write_outcome=report.write_outcome) from error
 
     @readonly_retry
     async def list_projects(self) -> list[Project]:
@@ -206,7 +208,11 @@ class MySQLProjectRepository:
                         (status.value, normalized_id),
                     ))
                     if cursor.rowcount == 0:
-                        raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}", code=ErrorCode.PROJECT_NOT_FOUND)
+                        await self.database.run(cursor.execute(
+                            "SELECT id FROM projects WHERE id = %s", (normalized_id,),
+                        ))
+                        if await self.database.run(cursor.fetchone()) is None:
+                            raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}", code=ErrorCode.PROJECT_NOT_FOUND)
             project = await self.get_project(normalized_id)
             if project is None:
                 raise ProjectRepositoryError(f"找不到專案 ID：{normalized_id}", code=ErrorCode.PROJECT_NOT_FOUND)
@@ -223,13 +229,19 @@ class MySQLProjectRepository:
             async with self.database.transaction() as connection:
                 async with connection.cursor() as cursor:
                     await self.database.run(cursor.execute(
+                        "SELECT owner_guild_id FROM projects WHERE id = %s FOR UPDATE", (project.id,),
+                    ))
+                    existing = await self.database.run(cursor.fetchone())
+                    if existing is not None and existing["owner_guild_id"] != project.owner_guild_id:
+                        raise ProjectRepositoryError("匯入專案所有權與目標資料不一致；請先查證。", code=ErrorCode.FORBIDDEN_ACTION)
+                    await self.database.run(cursor.execute(
                         """
-                        INSERT INTO projects (id, category, title, budget, deadline, status)
-                        VALUES (%s, %s, %s, %s, %s, %s) AS new
+                        INSERT INTO projects (id, category, title, budget, deadline, status, owner_guild_id)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s) AS new
                         ON DUPLICATE KEY UPDATE
                             category = new.category, title = new.title,
                             budget = new.budget, deadline = new.deadline,
-                            status = new.status
+                            status = new.status, owner_guild_id = new.owner_guild_id
                         """,
                         (
                             project.id,
@@ -238,6 +250,7 @@ class MySQLProjectRepository:
                             project.budget,
                             project.deadline,
                             project.status.value,
+                            project.owner_guild_id,
                         ),
                     ))
                     for table in (

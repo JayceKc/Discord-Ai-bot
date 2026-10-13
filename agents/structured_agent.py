@@ -75,9 +75,26 @@ class StructuredAgent(Generic[OutputModel]):
             # model_validate_json 同時解析 JSON 並檢查必要欄位與資料型別。
             output = self.output_model.model_validate_json(response.content)
         except ValidationError as error:
-            raise AgentSchemaValidationError(
+            failure = AgentSchemaValidationError(
                 f"{self.config.name} 回覆格式不正確，請重新產生。"
-            ) from error
+            )
+            # 只傳宣告過的欄位名稱與錯誤型別，不複製 input/msg/任意 ctx。
+            names = set()
+            def declared_fields(schema):
+                if isinstance(schema, dict):
+                    names.update(schema.get('properties', {}))
+                    for child in schema.values():
+                        declared_fields(child)
+                elif isinstance(schema, list):
+                    for child in schema:
+                        declared_fields(child)
+            declared_fields(self.output_model.model_json_schema())
+            details = []
+            for item in error.errors(include_input=False, include_url=False)[:5]:
+                path = '.'.join(str(part) if isinstance(part, int) or part in names else '?' for part in item['loc'])
+                details.append(f"{path or '輸出結構'}：{item['type']}")
+            failure.validation_feedback = '請依既定 Schema 修正驗證欄位：' + '；'.join(details)
+            raise failure from error
         findings = incomplete_paths(output.model_dump(mode="json"))
         if findings:
             error = AgentSchemaValidationError("模型文字未完整收尾，請用完整短句重新產生。")

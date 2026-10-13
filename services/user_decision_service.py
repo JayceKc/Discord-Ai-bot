@@ -123,17 +123,27 @@ class UserDecisionService:
             prompt = json.dumps(context, ensure_ascii=False)
         prompt = m._validate_prompt_budget(prompt)
         await emit_progress(record, "decision_preparation", agent_name="PM Agent")
-        response = await m._retry_operation(lambda: m._pm_agent.create_decision(prompt),
-            meeting_id=record.meeting_id, agent_name="PM Decision Agent", stage="user_decision")
-        question = DecisionQuestion.model_validate(response.model_dump(mode="json"))
-        for source in question.sources:
-            if source.step_index >= len(record.steps):
-                raise MeetingManagerError("決策分歧引用不存在的 Agent 步驟。", code=ErrorCode.LLM_INVALID_OUTPUT)
-            step = record.steps[source.step_index]
-            if step.round_number not in {1, 2} or not step.output_data or not any(
-                source.quote in value for value in self._strings(step.output_data)
-            ):
-                raise MeetingManagerError("決策分歧必須逐字引用已保存的討論內容，請重試 /review。", code=ErrorCode.LLM_INVALID_OUTPUT)
+        feedback = None
+        async def create_checked():
+            nonlocal feedback
+            repair = getattr(m._pm_agent, "create_decision_with_validation_feedback", None)
+            response = await (repair(prompt, feedback) if feedback and callable(repair)
+                else m._pm_agent.create_decision(prompt))
+            question = DecisionQuestion.model_validate(response.model_dump(mode="json"))
+            for source in question.sources:
+                step = record.steps[source.step_index] if source.step_index < len(record.steps) else None
+                if (step is None or step.round_number not in {1, 2}
+                        or getattr(step.status, 'value', step.status) != 'completed'
+                        or not step.output_data or not any(source.quote in value for value in self._strings(step.output_data))):
+                    from agents.structured_agent import AgentSchemaValidationError
+                    feedback = "sources 必須逐字引用 discussion 中已完成的 Agent 原文，並使用該項的 step_index。不得改寫引用。"
+                    raise AgentSchemaValidationError("決策分歧必須逐字引用已保存的討論內容，請重試 /review。")
+            return question
+        try:
+            question = await m._retry_operation(create_checked,
+                meeting_id=record.meeting_id, agent_name="PM Decision Agent", stage="user_decision")
+        except RetryableAgentError as error:
+            raise MeetingManagerError(str(error), code=ErrorCode.LLM_INVALID_OUTPUT) from error
         record.user_decision = {"question": question.model_dump(mode="json"), "history": [], "selection": None}
         record.decision_status = "awaiting_choice"
         record.decision_version += 1

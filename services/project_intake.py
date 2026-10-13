@@ -6,6 +6,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import date
+import json
 
 from models.project import RequirementChange
 
@@ -37,6 +38,7 @@ class IntakeSession:
     stage: str = "collecting"
     project_id: str | None = None
     submission_project_id: str | None = None
+    submission_change_id: str | None = None
     change_id: str | None = None
     change: RequirementChange | None = None
     updated_at: float = field(default_factory=time.monotonic)
@@ -48,14 +50,16 @@ class IntakeSession:
 class ProjectIntake:
     """只保存尚未提交的草稿；重啟會清除，正式專案仍由 Repository 保存。"""
 
-    def __init__(self, *, ttl_seconds: float = 1800) -> None:
+    def __init__(self, *, ttl_seconds: float = 1800, max_prompt_characters: int = 6000) -> None:
         self.sessions: dict[tuple[int, int, int], IntakeSession] = {}
         self.ttl_seconds = ttl_seconds
+        # 保留角色上下文／近期經驗空間，不能把整個模型預算都用於原始需求。
+        self.requirement_budget = max_prompt_characters - min(2400, max_prompt_characters // 2)
 
     def get(self, guild_id: int, channel_id: int, user_id: int) -> IntakeSession | None:
         key = (guild_id, channel_id, user_id)
         session = self.sessions.get(key)
-        if session and time.monotonic() - session.updated_at > self.ttl_seconds and not session.running and session.stage != "write_outcome_unknown":
+        if session and time.monotonic() - session.updated_at > self.ttl_seconds and not session.running and session.stage not in {"write_outcome_unknown", "change_outcome_unknown"}:
             self.sessions.pop(key, None)
             return None
         return session
@@ -121,7 +125,39 @@ class ProjectIntake:
             except ValueError:
                 return "日期不存在，請使用有效的 YYYY-MM-DD。"
         session.updated_at = time.monotonic()
+        if session.missing_field() is None:
+            error = self.validate_prompt(session)
+            if error:
+                # 留在目前欄位，讓使用者可直接回覆較短的內容。
+                session.fields.pop(field_name)
+                session.awaiting_confirmation = False
+                return error
         session.awaiting_confirmation = session.missing_field() is None
+        return None
+
+    def validate_prompt(self, session: IntakeSession) -> str | None:
+        encoded = json.dumps({"requirement": format_requirement(session.fields)}, ensure_ascii=False)
+        if len(encoded) > self.requirement_budget:
+            return f"需求與驗收合併過長，含預算／期限需在 {self.requirement_budget} 字元內；請縮短本欄位，或用「修改需求：內容」「修改驗收：內容」調整。"
+        return None
+
+    def update_text_field(self, session, name, text):
+        items = tuple(line.strip() for line in text.splitlines() if line.strip())
+        if not items or len(items) > 20 or any(len(item) > 1000 for item in items):
+            return "請提供 1–20 行，每行最多 1000 字。"
+        previous = session.fields.get(name)
+        session.fields[name] = items
+        session.awaiting_confirmation = session.missing_field() is None
+        if session.awaiting_confirmation:
+            error = self.validate_prompt(session)
+            if error:
+                # 拒絕的修改不污染已驗證草稿，避免欄位齊全卻不能確認。
+                if previous is None:
+                    session.fields.pop(name)
+                else:
+                    session.fields[name] = previous
+                session.awaiting_confirmation = session.missing_field() is None and self.validate_prompt(session) is None
+                return error
         return None
 
     @staticmethod
@@ -133,3 +169,10 @@ class ProjectIntake:
             f"預算：NT$ {fields['budget']:,}\n期限：{fields['deadline'].isoformat()}\n"
             f"驗收：{'；'.join(fields['acceptance_criteria'])}"
         )
+
+
+def format_requirement(fields) -> str:
+    """入口檢查與實際模型輸入使用同一格式。"""
+    return "\n".join((*fields['requirements'],
+        f"硬性預算上限：{fields['budget']}", f"硬性交付期限：{fields['deadline'].isoformat()}",
+        "驗收條件：" + "；".join(fields['acceptance_criteria'])))

@@ -31,7 +31,9 @@ def checked_sources(proposal, catalogue):
                     round_number = int(round_text)
                 matches = [label for label in matches if label == f"{agent.group()} 第{round_number}輪"]
             if len(matches) != 1:
-                raise AgentSchemaValidationError("決策來源必須對應已完成的 Agent 與輪次；請使用 allowed_sources 中的完整標籤。")
+                error = AgentSchemaValidationError("決策來源必須對應已完成的 Agent 與輪次；請使用 allowed_sources 中的完整標籤。")
+                error.validation_feedback = "decisions.sources 每項必須逐字選自 allowed_sources；角色在兩輪都發言時，必須明確標示第1輪或第2輪，禁止只寫角色名稱或猜測輪次。"
+                raise error
             normalized.append(matches[0])
         decision["sources"] = list(dict.fromkeys(normalized))
     return result

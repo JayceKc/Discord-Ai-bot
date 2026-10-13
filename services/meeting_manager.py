@@ -9,6 +9,7 @@ from core.logging_security import log_error
 from services.workflow_events import reports_progress, emit_progress, emit_retry
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -275,8 +276,8 @@ class MeetingManager:
             else:
                 if record.project_id != normalized_project_id:
                     raise MeetingManagerError("目前會議不屬於指定專案。", code=ErrorCode.INVALID_STATE)
-                if record.status == MeetingStatus.FAILED:
-                    record = await self.resume(guild_id)
+                if record.status in {MeetingStatus.FAILED, MeetingStatus.RUNNING, MeetingStatus.PENDING}:
+                    record = await self.resume(guild_id, on_step=on_step)
                 elif record.status != MeetingStatus.COMPLETED:
                     raise MeetingManagerError("目前會議無法接續，請先取消或恢復。", code=ErrorCode.INVALID_STATE)
 
@@ -399,7 +400,7 @@ class MeetingManager:
             try:
                 response, prompt_tokens, completion_tokens, max_output_tokens = (
                     await self._retry_operation(
-                        lambda: self._call_pm_integration(prompt),
+                        self._pm_integration_operation(prompt),
                         meeting_id=record.meeting_id,
                         agent_name="PM Agent",
                         stage="proposal_draft",
@@ -407,7 +408,9 @@ class MeetingManager:
                 )
             except RuntimeError as error:
                 # AgentError 繼承 RuntimeError，內容已去除敏感資料，可提供給 Discord。
-                raise MeetingManagerError(code=classify_error(error).code) from error
+                report = classify_error(error)
+                raise MeetingManagerError(code=report.code,
+                    write_outcome="committed" if report.code.value.startswith(('LLM_', 'OLLAMA_')) else report.write_outcome) from error
             except Exception as error:
                 raise MeetingManagerError("PM 整合草案失敗。") from error
 
@@ -669,12 +672,16 @@ class MeetingManager:
     async def _call_pm_integration(
         self,
         prompt: str,
+        *,
+        validation_feedback: str | None = None,
     ) -> tuple[BaseModel, int | None, int | None, int | None]:
         """呼叫 PM 整合，並保留可用的 token 統計。"""
 
         integrate_with_metadata = getattr(self._pm_agent, "integrate_with_metadata", None)
         if callable(integrate_with_metadata):
-            detailed_response = await integrate_with_metadata(prompt)
+            repair = getattr(self._pm_agent, "integrate_with_validation_feedback", None)
+            detailed_response = await (repair(prompt, validation_feedback)
+                if validation_feedback and callable(repair) else integrate_with_metadata(prompt))
             from services.proposal_quality import checked_sources
             output = checked_sources(detailed_response.output.model_dump(mode="json"), json.loads(prompt).get("allowed_sources", []))
             return (
@@ -688,6 +695,18 @@ class MeetingManager:
         output = checked_sources(response.model_dump(mode="json"), json.loads(prompt).get("allowed_sources", []))
         response = type(response).model_validate(output)
         return response, None, None, None
+
+    def _pm_integration_operation(self, prompt):
+        """有限重試保留局部修正提示；不使用共用可變狀態或增加上限。"""
+        feedback = None
+        async def call():
+            nonlocal feedback
+            try:
+                return await self._call_pm_integration(prompt, validation_feedback=feedback)
+            except RetryableAgentError as error:
+                feedback = getattr(error, 'validation_feedback', None)
+                raise
+        return call
 
     async def _execute_workflow_agent(
         self,
@@ -920,7 +939,7 @@ class MeetingManager:
         try:
             response, prompt_tokens, completion_tokens, max_output_tokens = (
                 await self._retry_operation(
-                    lambda: self._call_pm_integration(prompt),
+                    self._pm_integration_operation(prompt),
                     meeting_id="final-proposal",
                     agent_name="PM Agent",
                     stage="final_proposal",
@@ -1028,7 +1047,6 @@ class MeetingManager:
             self._running_tasks[record.guild_id] = current_task
 
         try:
-            total_steps = len(record.steps) - start_index
             for index in range(start_index, len(record.steps)):
                 step = record.steps[index]
                 if step.status == MeetingStepStatus.COMPLETED:
@@ -1084,7 +1102,10 @@ class MeetingManager:
                 await emit_progress(record, "discussion", "completed", agent_name=step.agent_name, round_number=step.round_number, current=sum(s.round_number == step.round_number for s in record.steps[:index+1]), total=sum(s.round_number == step.round_number for s in record.steps))
                 if on_step is not None:
                     try:
-                        await on_step(index - start_index + 1, total_steps, step)
+                        # 恢復第二輪仍顯示 1/4，而不是把兩輪合計成 5/8。
+                        current = sum(s.round_number == step.round_number for s in record.steps[:index + 1])
+                        total = sum(s.round_number == step.round_number for s in record.steps)
+                        await on_step(current, total, step)
                     except Exception as notification_error:
                         context = ErrorContext(guild_id=record.guild_id, meeting_id=record.meeting_id,
                             stage='discussion', write_outcome='committed')
@@ -1094,16 +1115,18 @@ class MeetingManager:
             record.current_step_index = len(record.steps)
             await self._save(record)
             return record
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             # CancelledError 必須繼續向上拋出，但先保存可恢復辨識的狀態。
-            if record.status != MeetingStatus.CANCELLED:
-                record.transition_to(MeetingStatus.CANCELLED)
+            if record.status not in {MeetingStatus.CANCELLED, MeetingStatus.COMPLETED}:
+                # 外部工作中斷（例如程序關閉）仍須可接續；明確 cancel 已另存取消狀態。
+                explicit_cancel = error.args == ("meeting_cancel",)
+                record.transition_to(MeetingStatus.CANCELLED if explicit_cancel else MeetingStatus.FAILED)
                 step = record.steps[min(record.current_step_index, len(record.steps)-1)]
                 if step.status in {
                     MeetingStepStatus.PENDING,
                     MeetingStepStatus.RUNNING,
                 }:
-                    step.status = MeetingStepStatus.CANCELLED
+                    step.status = MeetingStepStatus.CANCELLED if explicit_cancel else MeetingStepStatus.FAILED
                 try:
                     await self._save(record)
                 except Exception as save_error:
@@ -1163,11 +1186,11 @@ class MeetingManager:
 
         running_task = self._running_tasks.get(guild_id)
         if running_task is not None:
-            running_task.cancel()
+            running_task.cancel("meeting_cancel")
         return record
 
     @reports_progress
-    async def resume(self, guild_id: int) -> MeetingRecord:
+    async def resume(self, guild_id: int, *, on_step: MeetingStepCallback | None = None) -> MeetingRecord:
         """從第一個失敗步驟繼續執行，保留先前成功結果。"""
 
         lock = self._guild_locks.setdefault(guild_id, asyncio.Lock())
@@ -1176,27 +1199,38 @@ class MeetingManager:
 
         async with lock:
             record = await self._get_for_guild(guild_id)
-            if record is None or record.status != MeetingStatus.FAILED:
+            if record is None or record.status not in {
+                MeetingStatus.FAILED, MeetingStatus.RUNNING, MeetingStatus.PENDING,
+            }:
                 raise MeetingManagerError("這個伺服器沒有可恢復的失敗會議。", code=ErrorCode.INVALID_STATE)
 
             failed_step = next(
                 (
                     step
                     for step in record.steps
-                    if step.status == MeetingStepStatus.FAILED
+                    if step.status != MeetingStepStatus.COMPLETED
                 ),
                 None,
             )
             if failed_step is None:
+                if record.status in {MeetingStatus.RUNNING, MeetingStatus.PENDING} and record.steps:
+                    # 最後一步已保存，只是階段完成的最後一次保存被中斷。
+                    if record.status == MeetingStatus.PENDING:
+                        record.transition_to(MeetingStatus.RUNNING)
+                    record.transition_to(MeetingStatus.COMPLETED)
+                    record.current_step_index = len(record.steps)
+                    await self._save(record)
+                    return record
                 raise MeetingManagerError("失敗會議中找不到可恢復的 Agent 步驟。", code=ErrorCode.INVALID_STATE)
 
             failed_step.status = MeetingStepStatus.PENDING
             failed_step.input_text = None
             failed_step.output_data = None
             failed_step.error = None
-            record.transition_to(MeetingStatus.RUNNING)
+            if record.status != MeetingStatus.RUNNING:
+                record.transition_to(MeetingStatus.RUNNING)
             await self._save(record)
-            return await self._run(record, already_running=True)
+            return await self._run(record, already_running=True, on_step=on_step)
 
     def _build_input(self, record: MeetingRecord, index: int) -> str:
         """依目前步驟組合需求與先前 Agent 的結構化結果。"""
@@ -1204,10 +1238,10 @@ class MeetingManager:
         if index == 0:
             if record.meeting_context.priority_snapshot is None:
                 return self._validate_prompt_budget(record.requirement)
-            return self._validate_prompt_budget(json.dumps({
+            return self._fit_prompt_context({
                 "requirement": record.requirement,
                 **self._priority_context(record),
-            }, ensure_ascii=False))
+            }, (("recent_experiences",),))
 
         agent_name = record.steps[index].agent_name
         current_step = record.steps[index]
@@ -1294,9 +1328,12 @@ class MeetingManager:
                 },
                 ensure_ascii=False,
             ))
-        return self._validate_prompt_budget(
-            json.dumps(context, ensure_ascii=False)
-        )
+        return self._fit_prompt_context(context, (
+            ("meeting_context", "suggestions"),
+            ("meeting_context", "round_summaries"),
+            ("recent_experiences",),
+            ("meeting_context", "previous_outputs"),
+        ))
 
     def _build_proposal_input(self, record: MeetingRecord) -> str:
         """挑選兩輪摘要與重要原文，避免把完整會議紀錄全部塞給 PM。"""
@@ -1361,9 +1398,49 @@ class MeetingManager:
             "decision_types": ["採用", "拒絕", "折衷"],
             **self._priority_context(record),
         }
-        return self._validate_prompt_budget(
-            json.dumps(context, ensure_ascii=False)
-        )
+        return self._fit_prompt_context(context, (
+            ("recent_experiences",), ("round_summaries",), ("important_originals",),
+        ))
+
+    def _fit_prompt_context(self, context: dict, optional_paths: tuple[tuple[str, ...], ...]) -> str:
+        """只縮減可選前文，不改保存原文、需求、變更或審查目標。"""
+        data = copy.deepcopy(context)
+
+        def encoded():
+            return json.dumps(data, ensure_ascii=False)
+
+        prompt = encoded()
+        if len(prompt) <= self.max_prompt_characters:
+            return prompt
+        if isinstance(data.get('meeting_context'), dict):
+            data['meeting_context']['omitted'] = True
+
+        def compact(value, limit, count):
+            if isinstance(value, str):
+                # 摘要內可能含 JSON，整行省略才不會切壞內嵌結構。
+                return whole_lines_excerpt(value, limit) if '\n' in value or value.startswith('{') else sentence_excerpt(value, limit)
+            if isinstance(value, list):
+                return [compact(item, limit, count) for item in value[:count]]
+            if isinstance(value, dict):
+                return {key: compact(item, limit, count) for key, item in value.items()}
+            return value
+
+        # 先移除重複的衍生建議，再精簡前文；仍保留來源角色與欄位。
+        for limit, count in ((160, 2), (100, 2), (60, 1), (30, 1)):
+            for path in optional_paths:
+                parent = data
+                for key in path[:-1]:
+                    parent = parent.get(key, {})
+                if path[-1] not in parent:
+                    continue
+                if path[-1] in {'suggestions', 'recent_experiences'}:
+                    parent[path[-1]] = []
+                else:
+                    parent[path[-1]] = compact(parent[path[-1]], limit, count)
+                prompt = encoded()
+                if len(prompt) <= self.max_prompt_characters:
+                    return prompt
+        return self._validate_prompt_budget(prompt)
 
     @staticmethod
     def _source_catalogue(record):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -59,6 +60,24 @@ def load_guilds(path: Path) -> list[tuple[int, str]]:
     ]
 
 
+async def prepare_meeting_imports(repository, records: list[MeetingRecord]) -> list[MeetingRecord]:
+    """先查證目標；版本屬於目標 Repository，不能沿用 JSON 的版本。"""
+    pending = []
+    for source in records:
+        existing = await repository.get(source.meeting_id)
+        if existing is not None:
+            before, after = source.to_dict(), existing.to_dict()
+            before.pop('storage_version', None)
+            after.pop('storage_version', None)
+            if before != after:
+                raise ValueError('目標已有不同內容的會議；停止匯入，請先備份及查證。')
+            continue
+        record = copy.deepcopy(source)
+        record.storage_version = 0
+        pending.append(record)
+    return pending
+
+
 async def run(args: argparse.Namespace) -> None:
     projects = JsonProjectRepository(args.projects_file).list_projects()
     guilds = load_guilds(Path(args.guild_projects_file))
@@ -85,15 +104,17 @@ async def run(args: argparse.Namespace) -> None:
         project_repository = MySQLProjectRepository(database)
         guild_store = MySQLGuildProjectStore(database)
         meeting_repository = MySQLMeetingRepository(database)
+        # 在任何 project/guild 寫入前查證；不同內容不可靠匯入繞過 CAS。
+        pending_meetings = await prepare_meeting_imports(meeting_repository, meetings)
         for project in projects:
             await project_repository.upsert_project(project)
         for guild_id, project_id in guilds:
             await guild_store.set_current_project(guild_id, project_id)
-        for record in meetings:
+        for record in pending_meetings:
             await meeting_repository.save(record)
     finally:
         await database.close()
-    print("已完成 MySQL 匯入；可重複執行，不會產生重複 ID。")
+    print("已完成 MySQL 匯入；相同會議略過，不同內容的既有會議拒絕覆蓋。專案仍依 ID 更新。")
 
 
 if __name__ == "__main__":

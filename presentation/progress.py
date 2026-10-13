@@ -40,8 +40,12 @@ def next_action(record, *, is_running=False):
     if status == "awaiting_approval":
         return "由原啟動者檢視方案、評估與風險後批准或駁回；備用：/decide choice:approve 或 reject。"
     if record.proposal_draft:
+        if record.applied_requirement_change is not None:
+            return "兩輪草案已保存，使用 /review 審查；自然語言入口回覆「重試」接續。需求變更已使用一次，不能再次 /change。"
         return "使用 /review 審查；自然語言流程在原 requests 頻道回覆「直接定稿」或「修改：具體需求」。"
     if record.status.value == "completed":
+        if record.applied_requirement_change is not None:
+            return "兩輪討論已完成。使用 /draft 整合草案，或在原專案入口回覆「重試」；不必 /resume，也不能再次 /change。"
         return "討論已完成，專案尚未批准。使用 /draft 整合草案；需要第二輪時先用 /change。"
     return "需確認上次處理狀態；用 /review 查看可接續產物，或重跑原會議指令。"
 

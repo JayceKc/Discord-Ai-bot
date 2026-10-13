@@ -32,7 +32,7 @@ from core.error_handler import ErrorHandler
 from core.logging_security import configure_safe_logging, register_secrets, log_error
 from presentation.discord_delivery import (safe_defer, safe_followup_send, safe_channel_send, safe_message_edit, safe_original_response_edit, DELIVERY_ERRORS)
 from services.project_submission_service import ProjectSubmissionService
-from models.meeting import MeetingRecord, MeetingStepRecord, ProposalMetrics
+from models.meeting import MeetingRecord, MeetingStatus, MeetingStepRecord, ProposalMetrics
 from presentation.message_chunks import split_discord_message as split_message_chunks
 from models.project import Project, RequirementChange
 from models.workspace import ProjectPriority
@@ -58,7 +58,7 @@ from services.project_meeting_service import (
     ProjectMeetingError,
     ProjectMeetingService,
 )
-from services.project_intake import ProjectIntake, QUESTIONS
+from services.project_intake import ProjectIntake, QUESTIONS, format_requirement
 from views.decision_view import DecisionPresenter
 from presentation.channel_router import ChannelRouter
 from presentation.progress import ProgressPresenter, build_status_embeds, build_intake_status_embeds
@@ -117,7 +117,7 @@ class DiscussionManager(Protocol):
     ) -> dict[str, object]:
         """建立或讀取 PM 整合草案。"""
 
-    async def resume(self, guild_id: int, *, on_progress: WorkflowProgressCallback | None = None) -> MeetingRecord:
+    async def resume(self, guild_id: int, *, on_step: MeetingStepCallback | None = None, on_progress: WorkflowProgressCallback | None = None) -> MeetingRecord:
         """恢復模型失敗後的會議步驟。"""
 
     async def get_proposal_metrics(self, guild_id: int) -> ProposalMetrics | None:
@@ -544,7 +544,7 @@ def create_bot(
     bot = MyBot(command_prefix="!", intents=intents, database=database,
         sync_guild_id=settings.discord_guild_id,
         allowed_mentions=discord.AllowedMentions.none())  # 指定文字指令使用 ! 開頭。
-    intake = ProjectIntake()
+    intake = ProjectIntake(max_prompt_characters=settings.max_meeting_prompt_length)
     bot.project_intake = intake
     project_intent_classifier = intent_classifier or ProjectIntentAgent(llm_service)
     decision_service = getattr(discussion_manager, "decision_service", None)
@@ -642,9 +642,7 @@ def create_bot(
     def meeting_requirement(project):
         if presenter is None:
             return "\n".join(project.requirements)
-        return "\n".join((*project.requirements,
-            f"硬性預算上限：{project.budget}", f"硬性交付期限：{project.deadline.isoformat()}",
-            "驗收條件：" + "；".join(project.acceptance_criteria)))
+        return format_requirement(vars(project))
 
     async def present_decision(guild_id, channel, status):
         if presenter is None or status == "legacy":
@@ -754,6 +752,18 @@ def create_bot(
         if session.running:
             return
         session.updated_at = time.monotonic()
+        if session.stage == 'change_outcome_unknown':
+            if content == '查證':
+                try:
+                    await submission_service.reconcile_change(session)
+                except Exception as error:
+                    await bot.error_handler.handle(error, ErrorContext(guild_id=message.guild.id,
+                        write_outcome='unknown'), channel=message.channel)
+                    return
+                await send_intake(message.channel, f'✅ 已查證變更 {session.change_id} 保存成功；回覆「重試」接續第二輪。')
+            else:
+                await send_intake(message.channel, '❌ 需求變更保存結果尚未確認。請回覆「查證」，不要再次新增變更。')
+            return
         if session.stage == 'write_outcome_unknown':
             if content == '查證':
                 try:
@@ -768,6 +778,16 @@ def create_bot(
             return
         if session.stage == 'submission_verified':
             await send_intake(message.channel, f'專案已保存；使用 /start project_id:{session.project_id} 接續。')
+            return
+        if session.project_id is None and content.startswith(('修改需求：', '修改驗收：')):
+            field = 'requirements' if content.startswith('修改需求：') else 'acceptance_criteria'
+            error = intake.update_text_field(session, field, content.split('：', 1)[1])
+            if error:
+                await send_intake(message.channel, f'❌ {error}')
+            elif session.awaiting_confirmation:
+                await send_intake(message.channel, f'請核對更新資料：\n{truncate_answer(intake.summary(session), 1500)}\n回覆「確認」開始。')
+            else:
+                await send_intake(message.channel, QUESTIONS[session.missing_field() or 'acceptance_criteria'])
             return
         if content == "取消" and session.project_id is None:
             intake.cancel(session)
@@ -814,7 +834,7 @@ def create_bot(
                 session.running = True
                 try:
                     change = await resolve_repository_result(
-                        add_change(message.guild.id, session.project_id, description)
+                        submission_service.submit_change(session, description)
                     )
                 except ProjectRepositoryError as error:
                     session.running = False
@@ -847,16 +867,31 @@ def create_bot(
             session.running = True
             try:
                 if session.stage == "second_round_failed" and session.change is not None:
-                    try:
+                    record = await latest_record(message.guild.id, strict=True)
+                    applied = record.applied_requirement_change if record is not None else None
+                    if applied is not None:
+                        if record.project_id != session.project_id or applied.id != session.change.id:
+                            raise MeetingManagerError(code=ErrorCode.INVALID_STATE)
+                        if record.status != MeetingStatus.COMPLETED:
+                            await run_workflow(discussion_manager.resume, message.guild.id,
+                                on_step=lambda current, total, step: display_intake_step(message.channel, current, total, step),
+                                channel=message.channel)
+                    else:
                         await run_workflow(discussion_manager.start_second_round, message.guild.id, session.change, on_step=lambda current, total, step: display_intake_step(
                                 message.channel, current, total, step,
                             ), channel=message.channel)
-                    except MeetingManagerError:
-                        # 第二輪若已部分執行，start_second_round 會拒絕重複套用；
-                        # resume 只會接續已保存的失敗步驟。
-                        await run_workflow(discussion_manager.resume, message.guild.id, channel=message.channel)
                 elif session.stage == "first_round_failed":
-                    await run_workflow(discussion_manager.resume, message.guild.id, channel=message.channel)
+                    record = await latest_record(message.guild.id, strict=True)
+                    if record is None or record.project_id != session.project_id:
+                        active = await meeting_service.prepare_project(message.guild.id, session.project_id)
+                        await run_workflow(discussion_manager.start_first_round, message.guild.id,
+                            active.id, meeting_requirement(active), **owner_kwargs(message.author.id),
+                            on_step=lambda current, total, step: display_intake_step(message.channel, current, total, step),
+                            channel=message.channel)
+                    elif record.status != MeetingStatus.COMPLETED:
+                        await run_workflow(discussion_manager.resume, message.guild.id,
+                            on_step=lambda current, total, step: display_intake_step(message.channel, current, total, step),
+                            channel=message.channel)
                 session.stage = (
                     "first_round_complete" if session.stage.startswith("first")
                     else "second_round_complete"
@@ -878,6 +913,10 @@ def create_bot(
         if session.awaiting_confirmation:
             if content != "確認":
                 await send_intake(message.channel, f"{message.author.mention} 請回覆「確認」開始建立並開會，或「取消」放棄。")
+                return
+            budget_error = intake.validate_prompt(session)
+            if budget_error:
+                await send_intake(message.channel, f'❌ {budget_error} 可用「修改需求：內容」或「修改驗收：內容」調整。')
                 return
             session.running = True
             if workspace_repository is None:
@@ -1151,7 +1190,10 @@ def create_bot(
             return
         await safe_followup_send(interaction, "⏳ 正在接續已保存的討論；可用 /status 查看進度。")
         try:
-            await run_workflow(discussion_manager.resume, interaction.guild_id, channel=getattr(interaction, "channel", None))
+            await run_workflow(discussion_manager.resume, interaction.guild_id,
+                on_step=lambda current, total, step: display_step_embeds(interaction.guild_id,
+                    getattr(interaction, "channel", None), current, total, step, interaction),
+                channel=getattr(interaction, "channel", None))
         except MeetingManagerError as error:
             await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
@@ -1376,11 +1418,14 @@ def create_bot(
         if not await safe_defer(interaction, thinking=True):
             return
         try:
-            project = await meeting_service.start_project(
-                interaction.guild_id,
-                project_id,
-            )
-        except ProjectMeetingError as error:
+            # 已占用但尚未建立會議的同一專案，可安全重試初始化。
+            previous = await latest_record(interaction.guild_id, strict=True)
+            if previous is not None and previous.final_proposal is None:
+                raise ProjectMeetingError(code=ErrorCode.INVALID_STATE)
+            prepare = getattr(meeting_service, 'prepare_project', None)
+            project = await (prepare(interaction.guild_id, project_id) if callable(prepare)
+                else meeting_service.start_project(interaction.guild_id, project_id))
+        except (ProjectMeetingError, MeetingManagerError) as error:
             logger.warning("/start 失敗 guild_id=%s：%s", interaction.guild_id, type(error).__name__)
             await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
@@ -1392,7 +1437,7 @@ def create_bot(
         )
         embed.add_field(name="狀態", value=project.status.label, inline=True)
         embed.add_field(name="期限", value=project.deadline.isoformat(), inline=True)
-        await interaction.followup.send(embed=embed)
+        await safe_followup_send(interaction, embed=embed)
 
         async def display_agent_step(
             current: int,
@@ -1414,7 +1459,7 @@ def create_bot(
             await bot.error_handler.handle(error, ErrorContext(guild_id=interaction.guild_id, write_outcome="unknown"), interaction=interaction)
             return
 
-        await interaction.followup.send("✅ 第一輪討論完成。下一步：/draft 整合草案；若要第二輪，先用 /change。")
+        await safe_followup_send(interaction, "✅ 第一輪討論完成。下一步：/draft 整合草案；若要第二輪，先用 /change。")
         logger.info(
             "第一輪討論完成 guild_id=%s project_id=%s",
             interaction.guild_id,

@@ -181,6 +181,10 @@ class PMAgent(StructuredAgent[PMAnalysis]):
     async def create_decision(self, meeting_input: str) -> DecisionQuestion:
         return await self._decision_agent.respond(meeting_input)
 
+    async def create_decision_with_validation_feedback(self, meeting_input: str, validation_feedback: str) -> DecisionQuestion:
+        response = await self._decision_agent.respond_with_validation_feedback(meeting_input, validation_feedback)
+        return response.output
+
     async def apply_decision(self, meeting_input: str) -> StructuredAgentResponse[UserChoiceProposal]:
         return await self._choice_agent.respond_with_metadata(meeting_input)
 
@@ -234,7 +238,24 @@ class PMAgent(StructuredAgent[PMAnalysis]):
     async def integrate(self, meeting_input: str) -> PMProposalDraft:
         """將兩輪討論整合成固定章節與決策紀錄。"""
 
-        return await self._proposal_agent.respond(meeting_input)
+        return await self._proposal_for_input(meeting_input).respond(meeting_input)
+
+    def _proposal_for_input(self, meeting_input: str):
+        """來源限制只屬於本次會議，不污染其他 Guild 共用的 Agent。"""
+        try:
+            context = json.loads(meeting_input)
+        except json.JSONDecodeError:
+            return self._proposal_agent
+        catalogue = context.get('allowed_sources') if isinstance(context, dict) else None
+        if not isinstance(catalogue, list) or not catalogue or not all(isinstance(label, str) for label in catalogue):
+            return self._proposal_agent
+        schema = PMProposalDraft.model_json_schema()
+        schema['$defs']['PMDecision']['properties']['sources']['items']['enum'] = list(catalogue)
+        config = replace(self._proposal_agent.config, json_schema=schema)
+        return StructuredAgent(config, self.llm_service, PMProposalDraft)
+
+    async def integrate_with_validation_feedback(self, meeting_input: str, validation_feedback: str):
+        return await self._proposal_for_input(meeting_input).respond_with_validation_feedback(meeting_input, validation_feedback)
 
     async def integrate_with_metadata(
         self,
@@ -242,4 +263,4 @@ class PMAgent(StructuredAgent[PMAnalysis]):
     ) -> StructuredAgentResponse[PMProposalDraft]:
         """建立整合草案，並保留 Token 使用量與 1600 Token 上限。"""
 
-        return await self._proposal_agent.respond_with_metadata(meeting_input)
+        return await self._proposal_for_input(meeting_input).respond_with_metadata(meeting_input)

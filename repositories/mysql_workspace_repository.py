@@ -92,7 +92,13 @@ class MySQLWorkspaceRepository:
                         (priority.value, guild_id),
                     ))
                     if cursor.rowcount == 0:
-                        raise WorkspaceRepositoryError("找不到工作區。")
+                        # 相同值更新也會回傳 0，需另外查證資料是否存在。
+                        await self.database.run(cursor.execute(
+                            "SELECT guild_id FROM workspaces WHERE guild_id = %s",
+                            (guild_id,),
+                        ))
+                        if await self.database.run(cursor.fetchone()) is None:
+                            raise WorkspaceRepositoryError("找不到工作區。")
             return await self.get(guild_id)
         except WorkspaceRepositoryError:
             raise
